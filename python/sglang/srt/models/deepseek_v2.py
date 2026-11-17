@@ -653,6 +653,8 @@ class DeepseekV2MoE(nn.Module):
         self.routed_quant_stream = routed_quant_stream
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
+        # Seam for DeepseekV4DecoderLayer._run_moe_ffn_dp_sync; a backend sets it.
+        self.dp_local_forward: Optional[Callable] = None
         self._fuse_finalize_all_reduce = (
             is_deepseek_v4
             and getattr(config, "hc_pre_from_prev_sublayer", False)

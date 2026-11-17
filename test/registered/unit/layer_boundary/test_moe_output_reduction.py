@@ -232,10 +232,12 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                     ),
                     namespace,
                 )
-                model = types.SimpleNamespace(
-                    dsa_enable_prefill_cp=False,
-                    mlp=lambda value, batch, **kwargs: reduce_moe_output(value),
-                )
+
+                def mlp(value, batch, **kwargs):
+                    return reduce_moe_output(value)
+
+                mlp.dp_local_forward = None
+                model = types.SimpleNamespace(dsa_enable_prefill_cp=False, mlp=mlp)
                 batch = types.SimpleNamespace(
                     dp_padding_mode=types.SimpleNamespace(is_max_len=lambda: True)
                 )

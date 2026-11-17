@@ -3903,6 +3903,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: Optional[torch.Tensor],
         input_ids_global: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # A MoE backend that exchanges tokens across attention-DP ranks itself (e.g. a
+        # fused expert-parallel kernel) may set ``mlp.dp_local_forward`` after loading.
+        # It gets this rank's own rows, before any DP gather, and returns their complete
+        # MoE output (routed plus shared experts, fully reduced): no DP gather, scatter
+        # or post-experts all-reduce runs here. Returning None takes the ordinary path.
+        # The attribute is None unless a backend sets it, so every in-tree platform
+        # keeps today's path.
+        dp_local_forward = self.mlp.dp_local_forward
+        if dp_local_forward is not None:
+            out = dp_local_forward(hidden_states, forward_batch, input_ids=input_ids)
+            if out is not None:
+                return out
         _use_cp = is_cp_active(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
