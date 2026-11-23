@@ -743,6 +743,175 @@ def test_layer_requirements_and_skips():
         )
 
 
+def test_k32z_switch_defers_the_gmm_preparation_here(monkeypatch):
+    """SGLANG_TPU_DSV41_EXPERT_FORMAT=k32z: the gmm preparation leaves the
+    checkpoint experts (sglang_tpu/dsv4_mxfp4_k32z.py). A layer that keeps
+    gmm_v2 gets the gmm layout here, bit for bit; an eligible layer takes the
+    K32Z operands (test_k32z_layer_takes_the_k32z_operands), and one whose
+    shape K32Z cannot lay out is refused before its weights are touched."""
+    from sglang_tpu import dsv4_mxfp4_k32z as k32z
+
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP", "1")
+    monkeypatch.setenv("SGLANG_TPU_DSV41_EXPERT_FORMAT", "k32z")
+    monkeypatch.setattr(op_mod, "_build_op", lambda *key: "op")
+    # The startup check: K32Z only with fused EP on.
+    monkeypatch.setenv("SGLANG_SHARED_EXPERT_TP1", "1")
+    op_mod.check_dsv41_fused_ep_env()
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP", "0")
+    with pytest.raises(ValueError, match="needs SGLANG_TPU_DSV41_FUSED_EP=1"):
+        op_mod.check_dsv41_fused_ep_env()
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP", "1")
+    gate, shared = _parts(torch.bfloat16)
+    ckpt = _checkpoint_experts(E, H, I, seed=5)
+    names = ("w13_weight", "w13_weight_scale_inv", "w2_weight", "w2_weight_scale_inv")
+    tensors = {n: t.numpy() for n, t in zip(names, ckpt)}
+    want = ref.run_gmm_prep(*(t.clone() for t in ckpt))
+
+    def deferred(**kwargs):
+        moe = _moe(tensors, gate, shared, **kwargs)
+        setattr(moe.experts, k32z.PENDING_ATTR, True)
+        return moe
+
+    def assert_gmm_layout(experts):
+        assert not k32z.is_deferred(experts)
+        for name, value in want.items():
+            got = getattr(experts, name).data
+            assert got.dtype == value.dtype and torch.equal(got, value), name
+
+    moe = deferred()
+    assert op_mod.unmet_layer_requirements(moe, ep=1, multimodal_enabled=False) == []
+    # I = 384: 2I is not a whole number of 512-column gate/up field groups.
+    with pytest.raises(ValueError, match="K32Z cannot lay out"):
+        op_mod.prepare_moe_layer_for_fused_ep(
+            moe, ep=1, ep_rank=0, multimodal_enabled=False
+        )
+    assert k32z.is_deferred(moe.experts) and moe.dp_local_forward is None
+    assert moe.experts.w13_weight.numel() == E * 2 * I * H // 2
+    for attr in ("is_hash", "is_nextn"):
+        moe = deferred()
+        setattr(moe, attr, True)
+        assert not op_mod.prepare_moe_layer_for_fused_ep(
+            moe, ep=1, ep_rank=0, multimodal_enabled=False
+        )
+        assert_gmm_layout(moe.experts)
+    # A model with no V4.1 MoE layer: its deferred FP4 experts keep gmm_v2.
+    other = deferred()
+    other.config = _config(model_type="deepseek_v4")
+    assert op_mod.prepare_model_for_dsv41_fused_ep(torch.nn.ModuleList([other])) == 0
+    assert_gmm_layout(other.experts)
+
+
+# K32Z's tiny served structure: whole 256s, gate/up shifts of at most 3.
+K32Z_H, K32Z_I = 512, 256
+
+
+def _k32z_checkpoint_experts(num_experts, seed):
+    rng = np.random.default_rng(seed)
+    w13 = rng.integers(0, 256, (num_experts, 2 * K32Z_I, K32Z_H // 2), dtype=np.uint8)
+    w2 = rng.integers(0, 256, (num_experts, K32Z_H, K32Z_I // 2), dtype=np.uint8)
+    e13 = rng.integers(
+        118, 122, (num_experts, 2 * K32Z_I, K32Z_H // 32), dtype=np.uint8
+    )
+    e2 = rng.integers(112, 126, (num_experts, K32Z_H, K32Z_I // 32), dtype=np.uint8)
+    return w13, e13, w2, e2
+
+
+@pytest.mark.parametrize("bits", [2, 4])
+def test_k32z_layer_takes_the_k32z_operands(monkeypatch, bits):
+    """An eligible deferred layer: the K32Z op (format and width in its key and
+    name) and the K32Z operands, the codes relaid out as the gmm layout's and
+    the shift tables flat, equal to the loader's conversion byte for byte."""
+    from sglang_tpu import dsv4_mxfp4_k32z as k32z
+
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP", "1")
+    monkeypatch.setenv("SGLANG_TPU_DSV41_EXPERT_FORMAT", "k32z")
+    monkeypatch.setenv("SGLANG_TPU_DSV41_K32Z_GATE_UP_BITS", str(bits))
+    built = []
+    monkeypatch.setattr(op_mod, "_build_op", lambda *key: built.append(key) or "op")
+    w13, e13, w2, e2 = _k32z_checkpoint_experts(E, seed=7)
+    names = ("w13_weight", "w13_weight_scale_inv", "w2_weight", "w2_weight_scale_inv")
+    tensors = {
+        "w13_weight": w13,
+        "w13_weight_scale_inv": ref.e8m0_to_float32(e13).numpy(),
+        "w2_weight": w2,
+        "w2_weight_scale_inv": ref.e8m0_to_float32(e2).numpy(),
+    }
+    assert set(tensors) == set(names)
+    want = k32z.convert_mxfp4_experts_to_k32z(
+        torch.from_numpy(w13),
+        ref.e8m0_to_float32(e13),
+        torch.from_numpy(w2),
+        ref.e8m0_to_float32(e2),
+        gate_up_bits=bits,
+    )
+    g = torch.Generator().manual_seed(2)
+    gate = FakeGate(
+        torch.zeros(2 * E, K32Z_H, dtype=torch.bfloat16),
+        torch.randn(2 * E, generator=g),
+        torch.randn(2 * E, generator=g),
+    )
+    config = _config(
+        n_routed_experts=2 * E, hidden_size=K32Z_H, moe_intermediate_size=K32Z_I
+    )
+    moe = FakeMoE(
+        config,
+        gate,
+        FakeExperts(tensors, 0, E),
+        FakeShared(torch.zeros(2, K32Z_H), torch.zeros(K32Z_H, 1)),
+    )
+    setattr(moe.experts, k32z.PENDING_ATTR, True)
+    with op_mod.kernel_override(None):
+        assert op_mod.prepare_moe_layer_for_fused_ep(
+            moe, ep=2, ep_rank=1, multimodal_enabled=False
+        )
+    key = (2, TOPK, True, SCALE, K32Z_I, "ep", "k32z", bits)
+    assert built == [key]
+    assert getattr(moe, op_mod._KEY_ATTR) == key
+    assert op_mod._op_name(*key).endswith(f"_i{K32Z_I}_k32z_g{bits}_c256_ep")
+    # The K512 name is unchanged.
+    assert op_mod._op_name(*key[:6]).endswith(f"_i{K32Z_I}_c128_q512_ep")
+    experts = moe.experts
+    assert not k32z.is_deferred(experts)
+    assert getattr(experts, k32z.FORMAT_ATTR) == "k32z"
+    for name in ("w13_weight", "w2_weight", "w13_weight_shift", "w2_weight_shift"):
+        assert getattr(experts, name).numel() == 0, f"{name} must be freed"
+    w1, w2_ = getattr(experts, op_mod.W1), getattr(experts, op_mod.W2)
+    s1, s2 = getattr(experts, op_mod.W1_SCALE), getattr(experts, op_mod.W2_SCALE)
+    assert w1.dtype == w2_.dtype == FP4_X2
+    assert w1.shape == (E, K32Z_H, K32Z_I)  # float4 [E, H, 2I]
+    assert w2_.shape == (E, K32Z_I, K32Z_H // 2)  # float4 [E, I, H]
+    np.testing.assert_array_equal(
+        _x2_to_float4(w1).view(np.uint8), ref.unpack_kpacked_fp4_codes(want.w13.numpy())
+    )
+    np.testing.assert_array_equal(
+        _x2_to_float4(w2_).view(np.uint8), ref.unpack_kpacked_fp4_codes(want.w2.numpy())
+    )
+    assert s1.dtype == s2.dtype == torch.uint8
+    np.testing.assert_array_equal(
+        s1.numpy(), want.w13_shift.numpy().reshape(-1, want.w13_shift.shape[-1])
+    )
+    np.testing.assert_array_equal(
+        s2.numpy(), want.w2_shift.numpy().reshape(-1, want.w2_shift.shape[-1])
+    )
+    assert s1.shape == (E * 32, 2 * K32Z_I * bits // 8)
+    assert s2.shape == (E * 32, K32Z_H // 2)
+    assert moe.dp_local_forward.func is op_mod.forward_fused_ep_moe
+
+
+def test_k32z_gate_up_width_is_checked(monkeypatch):
+    from sglang_tpu import dsv4_mxfp4_k32z as k32z
+
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP", "1")
+    monkeypatch.setenv("SGLANG_SHARED_EXPERT_TP1", "1")
+    monkeypatch.setenv("SGLANG_TPU_DSV41_EXPERT_FORMAT", "k32z")
+    monkeypatch.setenv("SGLANG_TPU_DSV41_K32Z_GATE_UP_BITS", "3")
+    with pytest.raises(ValueError, match="must be 2 or 4"):
+        op_mod.check_dsv41_fused_ep_env()
+    monkeypatch.setenv("SGLANG_TPU_DSV41_K32Z_GATE_UP_BITS", "4")
+    op_mod.check_dsv41_fused_ep_env()
+    assert k32z.selected_gate_up_bits() == 4
+
+
 def test_prepare_model_checks_and_counts(monkeypatch):
     import sglang.srt.layers.moe as moe_pkg
     import sglang.srt.runtime_context as rc
@@ -900,6 +1069,113 @@ def test_build_op_specs_and_signature(cpu_op):
     x = torch.empty(16, H, dtype=torch.bfloat16)
     fake = exported.fake(x, *[None] * 7)
     assert fake.shape == x.shape and fake.dtype == x.dtype
+
+
+# --------------------------------------------------------------------------- #
+# The dispatch switch (SGLANG_TPU_DSV41_FUSED_EP_DISPATCH).
+# --------------------------------------------------------------------------- #
+def test_dispatch_switch_is_checked_at_startup(monkeypatch):
+    """The dispatch and auto's bound are validated before the weights load, and
+    a dispatch other than the default needs the fused EP switch."""
+    for name in (
+        "SGLANG_TPU_DSV41_FUSED_EP",
+        "SGLANG_TPU_DSV41_EXPERT_FORMAT",
+        "SGLANG_TPU_DSV41_FUSED_EP_DISPATCH",
+        "SGLANG_TPU_DSV41_FUSED_EP_PUSH_MAX_ROWS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert op_mod.selected_dispatch() == ("all_gather", 1024)
+    op_mod.check_dsv41_fused_ep_env()
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_DISPATCH", "push")
+    with pytest.raises(ValueError, match="needs SGLANG_TPU_DSV41_FUSED_EP=1"):
+        op_mod.check_dsv41_fused_ep_env()
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP", "1")
+    monkeypatch.setenv("SGLANG_SHARED_EXPERT_TP1", "1")
+    op_mod.check_dsv41_fused_ep_env()
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_DISPATCH", " Auto ")
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_PUSH_MAX_ROWS", "512")
+    assert op_mod.selected_dispatch() == ("auto", 512)
+    for name, value, match in (
+        ("SGLANG_TPU_DSV41_FUSED_EP_PUSH_MAX_ROWS", "0", ">= 1"),
+        ("SGLANG_TPU_DSV41_FUSED_EP_DISPATCH", "all-gather", "must be one of"),
+    ):
+        monkeypatch.setenv(name, value)
+        with pytest.raises(ValueError, match=match):
+            op_mod.check_dsv41_fused_ep_env()
+
+
+def test_dispatch_is_in_the_op_key_and_name(monkeypatch):
+    """Push and auto ops get keys and names of their own, so their compiled
+    programs never mix with all-gather's; all-gather keys and names are the
+    ones from before push existed, and spellings of one op share one key."""
+    base = (8, 6, True, 1.5, 2304, "ep")
+    keys = {
+        "k512": op_mod._op_key(*base, "k512", 4, "all_gather", 512),
+        "k32z": op_mod._op_key(*base, "k32z", 4, "all_gather", 512),
+        "k512 push": op_mod._op_key(*base, "k512", 4, "push", 512),
+        "k512 auto": op_mod._op_key(*base, "k512", 4, "auto", 1024),
+        "k512 auto512": op_mod._op_key(*base, "k512", 4, "auto", 512),
+        "k32z push": op_mod._op_key(*base, "k32z", 4, "push", 512),
+        "k32z auto": op_mod._op_key(*base, "k32z", 4, "auto", 1024),
+    }
+    assert keys["k512"] == base and keys["k32z"] == base + ("k32z", 4)
+    # K512 has no field width and push no bound: neither splits the key.
+    assert keys["k512 push"] == base + ("k512", 0, "push", 0)
+    assert op_mod._op_key(*base, "k512", 2, "push", 64) == keys["k512 push"]
+    assert keys["k32z auto"] == base + ("k32z", 4, "auto", 1024)
+    head = "sglang_tpu_pallas::dsv41_fused_ep_ep8_k6_r1_s1_5_i2304"
+    assert {k: op_mod._op_name(*v) for k, v in keys.items()} == {
+        "k512": f"{head}_c128_q512_ep",
+        "k32z": f"{head}_k32z_g4_c256_ep",
+        "k512 push": f"{head}_c128_q512_push_ep",
+        "k512 auto": f"{head}_c128_q512_auto1024_ep",
+        "k512 auto512": f"{head}_c128_q512_auto512_ep",
+        "k32z push": f"{head}_k32z_g4_c256_push_ep",
+        "k32z auto": f"{head}_k32z_g4_c256_auto1024_ep",
+    }
+    with pytest.raises(ValueError, match="dispatch must be one of"):
+        op_mod._op_key(*base, "k512", 0, "pull", 1024)
+
+    built = []
+    monkeypatch.setattr(op_mod, "_build_op", lambda *k: built.append(k) or object())
+    with op_mod.kernel_override(None):
+        push = op_mod._get_op(*base, "k512", 4, "push", 1024)
+        assert op_mod._get_op(*keys["k512 push"]) is push
+        assert op_mod._get_op(*base) is not push
+    assert built == [keys["k512 push"], base]
+
+
+def test_auto_dispatch_is_static_per_bucket(cpu_op, monkeypatch):
+    """SGLANG_TPU_DSV41_FUSED_EP_DISPATCH=auto through the serving seam: the
+    prepared layer's op (dispatch and bound in its key and name) pushes a
+    bucket of at most PUSH_MAX_ROWS rows per EP rank, with #2102's tuned
+    bundle for the local experts, and all-gathers a larger one."""
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_DISPATCH", "auto")
+    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_PUSH_MAX_ROWS", "8")
+    seen = []
+
+    def kernel(x, w1, w2, w1_scale, w2_scale, gating, **kw):
+        seen.append(kw)
+        return x
+
+    gate, shared = _parts(torch.bfloat16)
+    moe = _moe(_gmm_prepared(E, H, I), gate, shared)
+    fb = SimpleNamespace(
+        num_token_non_padded=None, global_num_tokens_cpu=None, dp_padding_mode=None
+    )
+    with op_mod.kernel_override(kernel):
+        assert op_mod.prepare_moe_layer_for_fused_ep(
+            moe, ep=1, ep_rank=0, multimodal_enabled=False
+        )
+        for rows in (8, 16):
+            moe.dp_local_forward(torch.zeros(rows, H, dtype=torch.bfloat16), fb)
+    key = (1, TOPK, True, SCALE, I, "ep", "k512", 0, "auto", 8)
+    assert getattr(moe, op_mod._KEY_ATTR) == key
+    (exported,) = cpu_op
+    assert exported.name == op_mod._op_name(*key)
+    assert [kw["dispatch"] for kw in seen] == ["push", "all_gather"]
+    assert seen[0]["push_options"] == fe.tuned_push_options(E)
+    assert "push_options" not in seen[1]
 
 
 # --------------------------------------------------------------------------- #
