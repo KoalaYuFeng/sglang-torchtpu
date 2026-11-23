@@ -647,6 +647,26 @@ class TpuEnvs:
     # SGLANG_SHARED_EXPERT_TP1=1 (checked at startup). Read when the plugin
     # hooks are built; False registers nothing.
     SGLANG_TPU_DSV41_FUSED_EP = EnvBool(False)
+    # DeepSeek-V4.1 fused EP expert format: "k512" (default) requantizes the
+    # checkpoint's block-32 MXFP4 experts to block 512 (dsv4_mxfp4_moe.py);
+    # "k32z" converts them losslessly to K32Z operands (dsv4_mxfp4_k32z.py) in
+    # the fused EP preparation. k32z needs SGLANG_TPU_DSV41_FUSED_EP=1 (checked
+    # at startup); layers that keep gmm_v2 (hash-routed, NextN) still get k512.
+    SGLANG_TPU_DSV41_EXPERT_FORMAT = EnvStr("k512")
+    # K32Z gate/up shift-field width in bits, 4 (default) or 2. Every rank and
+    # layer uses the same width (it sets the operand shapes); the conversion
+    # refuses a layer whose gate/up shifts do not fit. The V4.1 Flash
+    # checkpoint's gate/up shifts reach 6 (most layers exceed 3), so 2-bit
+    # fields hold only some layers.
+    SGLANG_TPU_DSV41_K32Z_GATE_UP_BITS = EnvInt(4)
+    # DeepSeek-V4.1 fused EP token dispatch: "all_gather" (default), "push"
+    # (fused_moe_v2's push dispatch, fused_ep.tuned_push_options) or "auto",
+    # which pushes a compiled token bucket of at most
+    # SGLANG_TPU_DSV41_FUSED_EP_PUSH_MAX_ROWS rows per EP rank and all-gathers
+    # a larger one. Needs SGLANG_TPU_DSV41_FUSED_EP=1 (checked at startup).
+    SGLANG_TPU_DSV41_FUSED_EP_DISPATCH = EnvStr("all_gather")
+    # auto's bound in rows per EP rank (>= 1); see fused_ep.PUSH_MAX_ROWS.
+    SGLANG_TPU_DSV41_FUSED_EP_PUSH_MAX_ROWS = EnvInt(1024)
 
     @classmethod
     def names(cls) -> list[str]:
