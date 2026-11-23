@@ -48,6 +48,32 @@ PUSH_OPTIONS = (
     "single_barrier",
     "early_scale_scatter",
     "fuse_metadata",
+    # Step 7 K2 (off by default, except the K32Z push path's per-bucket
+    # defaults for defer_push, fold_select, x_tables and x_dedup when left
+    # unset: layer.K32Z_PUSH_DEFAULTS; ret_last_off and commit_only are
+    # benchmark only and give invalid output).
+    "visit_order",
+    "two_hop",
+    "defer_push",
+    "fold_select",
+    "ret_last_off",
+    "commit_only",
+    # Step 7 K2 dispatch dedup (off by default; x_gather_off is benchmark
+    # only and gives invalid output). See push_fused_moe.dedup.
+    "x_tables",
+    "x_dedup",
+    "x_dedup_local",
+    "x_owner_visit",
+    "x_gather_off",
+    "x_src_cap",
+    # Step 7 O (off by default; see push_fused_moe.dedup.receiver_tables).
+    "x_flat_owner",
+    # Step 11 E1 (off by default): the return's runs ship from inside their
+    # expert's tile loop on the two-hop path (push kernel `_es`).
+    "early_ship",
+    # Step 12 P2: the plan's per-pair slab rows from the exchange-table kernel
+    # (`_sr`); unset takes host.K32Z_PUSH_SLAB_ROWS (K32Z at 8-256 rows: on).
+    "exchange_slab_rows",
 )
 
 __all__ = ["PUSH_OPTIONS", "fused_ep_moe_push"]

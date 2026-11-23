@@ -26,6 +26,10 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from sglang_tpu.moe.pallas.fused_moe_v2 import host as _host
+from sglang_tpu.moe.pallas.fused_moe_v2 import es_select as _es_select
+from sglang_tpu.moe.pallas.fused_moe_v2 import l4_plan_pallas as _l4_plan_pallas
+from sglang_tpu.moe.pallas.fused_moe_v2 import l4_split
 from sglang_tpu.moe.pallas.fused_moe_v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -42,6 +46,7 @@ from sglang_tpu.moe.pallas.fused_moe_v2.host import (
     build_routing_tables_sharded,
     expert_visit_list,
     fp4_scale_rows,
+    k32z_table_geometry,
     local_slab_rows,
     pair_block_hist,
     pow2_shift,
@@ -59,6 +64,7 @@ from sglang_tpu.moe.pallas.fused_moe_v2.host import (
 from sglang_tpu.moe.pallas.fused_moe_v2.kernel import (
     build_combine_kernel,
     build_fused_ep_moe_kernel,
+    check_ablation,
     combine_step_tokens,
     rowquant_fp8,
 )
@@ -77,6 +83,9 @@ from sglang_tpu.moe.pallas.fused_moe_v2.token_parallel import (
 # The scoring functions the router can apply to the gate logits. These
 # mirror the `scoring_func` branches in python/sglang/srt/layers/moe/topk.py.
 SCORING_FNS = ("softmax", "sigmoid", "sqrtsoftplus")
+# The Step 7 R2 K32Z build choices (host.k32z_build_plan) a layer hands the
+# kernel builder only where they differ from its defaults.
+_K32Z_R2_CHOICES = ("k32z_roll_rungs", "push_from_vmem_rows", "defer_push")
 
 
 def _apply_scoring_fn(logits, scoring_fn, *, specialize_softplus=False):
@@ -151,6 +160,41 @@ def _lookup_row_scales(arrival_scales, scl, shift):
     return lax.bitcast_convert_type(word, jnp.float32).reshape(shape)
 
 
+def _on_sc_core(fn, core):
+    """`fn` compiled for SparseCore core `core` (compute_on), output in HBM."""
+    from jax.experimental.compute_on import compute_on
+
+    return compute_on(
+        fn,
+        compute_type="tpu_sparsecore",
+        out_memory_spaces=jax.memory.Space.Device,
+        compiler_options={"sparse_core_config": {"core_ids": [core]}},
+    )
+
+
+def _side_all_gather(x, ax, side):
+    """The tiled all-gather of `x` over `ax`: XLA's own (offloaded) one, or
+    with `side` (Step 7 O, host.SC_SIDE_CORE) the same collective on
+    SparseCore core 1."""
+    if not side:
+        return lax.all_gather(x, ax, axis=0, tiled=True)
+    return _on_sc_core(lambda p: lax.all_gather(p, ax, axis=0, tiled=True), 1)(x)
+
+
+def _side_scatter_add(side):
+    """(size, rows, vals) -> zeros(size).at[rows].add(vals, mode="drop") on
+    SparseCore core 1 (Step 7 O, host.SC_SIDE_CORE): the same integer
+    scatter-add as the layer's XLA one, off core 0's queue."""
+    del side
+
+    def scatter_add(size, rows, vals):
+        return _on_sc_core(
+            lambda r, v: jnp.zeros((size,), v.dtype).at[r].add(v, mode="drop"), 1
+        )(rows, vals)
+
+    return scatter_add
+
+
 def _combine_arrivals(
     arrivals,
     arrival_scales,
@@ -158,8 +202,25 @@ def _combine_arrivals(
     mirror_pos,
     topk_weights,
     out_dtype,
+    routes=None,
+    fuse_scales=False,
 ):
     """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden].
+
+    `routes` ([t_local, 1] bool; Step 7 K2f, host.COMBINE_FOLD_SELECT) also
+    zeroes the rows of tokens that routed nowhere: inside the combine kernel
+    where it applies (one route flag per token in scalar prefetch), as a
+    select after the XLA epilogue elsewhere; the same bits either way.
+
+    `fuse_scales` (Step 7 O, host.COMBINE_FUSE_SCALES) runs the arrival-scale
+    lookup inside the combine kernel, as push's fused-scale combine does
+    (kernel._build_combine_kernel's fuse_scales: the mirror, mirror positions
+    and router weights ride scalar prefetch and the same f32 scale * weight
+    product runs in SMEM), where the kernel path applies and the mirror is at
+    most one lane block wide; it removes the XLA gather of the row scales
+    (at 2048 rows per rank a 47.9 us gather_fusion between the expert kernel
+    and the combine). Same rows, same products, same sum order: the same
+    bits.
 
     Two tables index two different objects, so each owns its own clamp.
     `pos` is the arrival ROW: a row of `arrivals`, and on the kernel path
@@ -190,6 +251,22 @@ def _combine_arrivals(
     rows = jnp.minimum(pos, recv_rows - 1)
     shift = pow2_shift(tile_m, "the mirror's lane count")
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
+    if fuse_scales and combine_step_tokens(t_local) and tile_m <= HIDDEN_LANE_BLOCK:
+        # The flat mirror index of (scl >> shift, scl & (tile_m - 1)) is scl
+        # itself, which is what the fused lookup reads.
+        combine = build_combine_kernel(
+            fuse_scales=True,
+            t_local=t_local,
+            topk=topk,
+            hidden=hidden,
+            lane_blocks=lane_blocks,
+            wire_dtype=arrivals.dtype,
+            out_dtype=out_dtype,
+            **({} if routes is None else {"fold_select": True}),
+        )
+        if routes is None:
+            return combine(arrivals, arrival_scales, scl, topk_weights, rows)
+        return combine(arrivals, arrival_scales, scl, topk_weights, rows, routes=routes)
     row_scales = _lookup_row_scales(arrival_scales, scl, shift)
     coef = row_scales * topk_weights.astype(jnp.float32)
     if combine_step_tokens(t_local):
@@ -200,8 +277,11 @@ def _combine_arrivals(
             lane_blocks=lane_blocks,
             wire_dtype=arrivals.dtype,
             out_dtype=out_dtype,
+            **({} if routes is None else {"fold_select": True}),
         )
-        return combine(arrivals, coef, rows)
+        if routes is None:
+            return combine(arrivals, coef, rows)
+        return combine(arrivals, coef, rows, routes=routes)
     rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
     coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
     terms = []
@@ -211,7 +291,10 @@ def _combine_arrivals(
         )
         slot_coef = lax.slice(coef_k, (k * t_local,), ((k + 1) * t_local,))
         terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
-    return sum(terms).astype(out_dtype).reshape(t_local, hidden)
+    out = sum(terms).astype(out_dtype).reshape(t_local, hidden)
+    if routes is None:
+        return out
+    return jnp.where(routes, out, jnp.zeros_like(out))
 
 
 def _exchange_layout(t_local, topk, e_total, quantized):
@@ -419,6 +502,7 @@ def fused_ep_moe_v2(
     push_options=None,
     shared_expert=None,
     shared_limit=None,
+    ablation=frozenset(),
 ):
     """Run fused EP MoE with all-gather or push dispatch.
 
@@ -451,7 +535,22 @@ def fused_ep_moe_v2(
     dispatch="push" supports the fused stage only and takes explicit
     push_options from push_fused_moe.PUSH_OPTIONS. Optional replicated FP8
     shared_expert=(w13, s13, w2, s2) appends a separate shared output.
-    See README.md for placement, padding and caller-owned state contracts."""
+    See README.md for placement, padding and caller-owned state contracts.
+
+    K32Z (weight_format=WeightFormat.K32Z, either dispatch): w1/w2 are
+    float4 codes as FP4's, the scales the uint8 shift tables flat,
+    [E * rows1, cols1] and [E * rows2, cols2] of host.k32z_table_geometry;
+    the gate/up field width follows from cols1.
+
+    ablation (benchmark only, kernel.ABLATIONS) removes parts of the layer;
+    any non-empty set gives invalid output. On the all-gather dispatch
+    disp_off takes the compute stage with every block of route's payload
+    pre-gathered (routed[2] [ep, width] per shard), so the layer runs no
+    collective before the kernel; on the push dispatch it pre-pushes every
+    visit position on the SparseCore and the kernel dispatches nothing."""
+    ablation = check_ablation(ablation)
+    if "disp_off" in ablation and dispatch == "all_gather" and stage != "compute":
+        raise ValueError('disp_off takes stage="compute" with the payload pre-gathered')
     push_kw = _check_dispatch(
         dispatch,
         push_options=push_options,
@@ -497,6 +596,7 @@ def fused_ep_moe_v2(
             shared_expert=shared_expert,
             shared_limit=shared_limit,
             **push_kw,
+            **({"ablation": ablation} if ablation else {}),
         )
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -511,8 +611,10 @@ def fused_ep_moe_v2(
     # documented public entry, so the check belongs where the operands come
     # in rather than only in the serving adapter above it.
     for name, w in (("w1", w1), ("w2", w2)):
+        # Against the format's own element type: K32Z's weights are float4
+        # like FP4's, which weight_format_of_dtype names FP4.
         actual = weight_format_of_dtype(w.dtype)
-        if actual != weight_format:
+        if jnp.dtype(w.dtype) != jnp.dtype(form.weight_dtype):
             raise ValueError(
                 f"weight format {weight_format!r} takes "
                 f"{jnp.dtype(form.weight_dtype).name} expert weights and "
@@ -547,7 +649,37 @@ def fused_ep_moe_v2(
         and form.scale_layout == "per_contraction_block"
         and w1_scale.ndim == 2
     )
-    if pad_scale_rows:
+    # K32Z's shift tables come flat only, [E * rows, cols] uint8, whole u8
+    # sublane tiles per expert (so the per-expert view is a bitcast). The
+    # gate/up field width is whatever the table's columns say it is.
+    k32z_gate_up_bits = None
+    # How its FFN body walks the output chunks, read once per trace
+    # (host.K32Z_FFN_ROLL) and keyed below like every other build choice.
+    k32z_ffn_roll = None
+    k32z_roll_from = 0
+    # And whether its scale mirrors take 128-lane units (host.K32Z_MIRROR_UNIT).
+    mirror_unit = 0
+    k32z_rungs = None
+    if form.scale_layout == "column_shift":
+        cols1 = w1_scale.shape[-1] if w1_scale.ndim == 2 else -1
+        k32z_gate_up_bits = (cols1 * 8) // (2 * inter) if inter else 0
+        mirror_unit = _host.K32Z_MIRROR_UNIT
+        k32z_rungs = (
+            None
+            if tuple(_host.K32Z_RUNGS) == _host.K32Z_DEFAULT_RUNGS
+            else tuple(_host.K32Z_RUNGS)
+        )
+        geo = k32z_table_geometry(hidden, inter, k32z_gate_up_bits)
+        for name, s, want in (
+            ("w1_scale", w1_scale, (e_total * geo.rows1, geo.cols1)),
+            ("w2_scale", w2_scale, (e_total * geo.rows2, geo.cols2)),
+        ):
+            if tuple(s.shape) != want or jnp.dtype(s.dtype) != jnp.dtype(jnp.uint8):
+                raise ValueError(
+                    f"{name} {jnp.dtype(s.dtype).name}{tuple(s.shape)} is not the "
+                    f"flat K32Z shift table uint8{want} the kernel takes"
+                )
+    elif pad_scale_rows:
         for name, s, k, n in (
             ("w1_scale", w1_scale, hidden, 2 * inter),
             ("w2_scale", w2_scale, inter, hidden),
@@ -675,6 +807,92 @@ def fused_ep_moe_v2(
                 "hash_topk_ids are expert ids and must be an integer dtype; "
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
+    k32z_r2 = {}
+    if k32z_gate_up_bits is not None:
+        # How the K32Z bodies walk their chunks and the Step 7 R2 choices,
+        # from the knobs and this build's slab (host.k32z_build_plan); keyed
+        # below like the rest. The R2 choices go to the builder only where
+        # they differ from its defaults, so a default build is unchanged.
+        k32z_plan = _host.k32z_build_plan(ragged_stride, ep, g_local, hidden, inter)
+        k32z_ffn_roll = k32z_plan["k32z_ffn_roll"]
+        k32z_roll_from = k32z_plan["k32z_roll_from"]
+        k32z_rungs = k32z_plan["k32z_rungs"]
+        k32z_r2 = {
+            k: v
+            for k, v in k32z_plan.items()
+            if k in _K32Z_R2_CHOICES and v != _host.K32Z_PLAN_DEFAULTS[k]
+        }
+    # Step 7 K2f: the zeroing select of unrouted rows inside the combine
+    # kernel (host.COMBINE_FOLD_SELECT, read once per trace); left unset, on
+    # for a K32Z build where the combine kernel applies (Step 7 K3).
+    fold_select = _host.COMBINE_FOLD_SELECT
+    if fold_select is None:
+        fold_select = k32z_gate_up_bits is not None and bool(
+            combine_step_tokens(t_local)
+        )
+    fold_select = bool(fold_select)
+    # Step 7 O: the arrival-scale lookup inside the combine kernel
+    # (host.COMBINE_FUSE_SCALES, read once per trace; host.combine_fuse_scales
+    # gives its default per build).
+    fuse_scales = _host.combine_fuse_scales(
+        _host.COMBINE_FUSE_SCALES,
+        k32z=k32z_gate_up_bits is not None,
+        t_local=t_local,
+    )
+    # Step 7 O: the wire rows quantized ahead of the router
+    # (host.QUANTIZE_FIRST, read once per trace; host.quantize_first gives
+    # its default per build).
+    quantize_first = _host.quantize_first(
+        _host.QUANTIZE_FIRST,
+        k32z=k32z_gate_up_bits is not None,
+        t_local=t_local,
+    )
+    # Step 7 O: the SparseCore core of the token all-gather where it is not
+    # the split-SparseCore path's (host.TOKEN_AG_CORE, read once per trace;
+    # host.token_ag_core gives its default per build; 0: XLA's own offload).
+    token_ag_core = _host.token_ag_core(
+        _host.TOKEN_AG_CORE,
+        k32z=k32z_gate_up_bits is not None,
+        t_local=t_local,
+    )
+    # Step 7 O: side SparseCore work on core 1 (host.SC_SIDE_CORE, read once
+    # per trace; host.sc_side_core gives its default per build): 1 = the
+    # metadata all-gather and the slab scatters, 2 = the slab scatters only.
+    # Not with the token all-gather on core 1.
+    sc_side = (
+        0
+        if token_ag_core
+        else _host.sc_side_core(
+            _host.SC_SIDE_CORE,
+            k32z=k32z_gate_up_bits is not None,
+            t_local=t_local,
+        )
+    )
+    # Step 10 L4: the hot expert's rows split with the sibling TensorCore
+    # (host.K32Z_L4_SPLIT, read once per trace; l4_split). Off unless the
+    # mesh's devices pair up into chips; a build without it keeps its program.
+    l4_partners = None
+    l4_mode = _host.l4_split_mode(
+        _host.K32Z_L4_SPLIT, k32z=k32z_gate_up_bits is not None, t_local=t_local
+    )
+    if l4_mode:
+        l4_partners = l4_split.sibling_partners(mesh)
+        if l4_partners is None or has_w1_bias or has_w2_bias:
+            l4_mode = 0
+    # Step 10 follow-up: early shipping of every own expert's runs
+    # (host.K32Z_EARLY_SHIP, read once per trace; kernel-only).
+    early_ship = _host.early_ship_mode(
+        _host.K32Z_EARLY_SHIP, k32z=k32z_gate_up_bits is not None, t_local=t_local
+    )
+    # Step 11 S1: mode 2 switches the early shipping per call inside the
+    # kernel (early_ship_flag), from the plan (host.early_ship_pick); an L4
+    # build keeps its own kernel.
+    es_select = not l4_mode and _host.early_ship_select(
+        _host.K32Z_EARLY_SHIP,
+        k32z=k32z_gate_up_bits is not None,
+        t_local=t_local,
+        ep=ep,
+    )
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -689,6 +907,27 @@ def fused_ep_moe_v2(
         has_w2_bias=has_w2_bias,
         pad_scale_rows=pad_scale_rows,
         logical_intermediate_size=logical_intermediate_size,
+        **(
+            {}
+            if k32z_gate_up_bits is None
+            else {
+                "k32z_gate_up_bits": k32z_gate_up_bits,
+                "k32z_ffn_roll": k32z_ffn_roll,
+                "k32z_roll_from": k32z_roll_from,
+                "mirror_unit": mirror_unit,
+                # Read at trace time; None where it is the default ladder.
+                "k32z_rungs": k32z_rungs,
+                **k32z_r2,
+            }
+        ),
+        **(
+            {"l4": True, "l4_stream": l4_mode in _host.K32Z_L4_STREAM_MODES}
+            if l4_mode
+            else {}
+        ),
+        **({"early_ship": True} if early_ship else {}),
+        **({"early_ship": True, "early_ship_flag": True} if es_select else {}),
+        **({"ablation": ablation} if ablation else {}),
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -710,6 +949,11 @@ def fused_ep_moe_v2(
             w2s_l = next(operands).reshape(
                 g_local, fp4_scale_rows(inter, rhs_qb, padded=True), hidden
             )
+        elif k32z_gate_up_bits is not None:
+            # The same for the K32Z shift tables: whole u8 sublane tiles.
+            geo = k32z_table_geometry(hidden, inter, k32z_gate_up_bits)
+            w1s_l = next(operands).reshape(g_local, geo.rows1, geo.cols1)
+            w2s_l = next(operands).reshape(g_local, geo.rows2, geo.cols2)
         else:
             w1s_l = next(operands) if form.has_scales else None
             w2s_l = next(operands) if form.has_scales else None
@@ -941,6 +1185,7 @@ def fused_ep_moe_v2(
             block=block,
             tile_m=capacity,
             shard_stride=ragged_stride,
+            mirror_m=_host.mirror_lanes(capacity, mirror_unit),
         )
         if sharded_plan:
             routing = build_routing_tables_sharded(
@@ -956,6 +1201,29 @@ def fused_ep_moe_v2(
         # the other shards are dropped where they are computed rather than
         # built into a replicated slab and sliced away afterwards.
         slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
+        if l4_mode:
+            # Step 10 L4: the split, decided from the plan every rank holds;
+            # the helper's slab takes the hot expert's tail rows after its own
+            # experts, so the scatters below fill them like any other row.
+            # Step 12 P3: host.K32Z_L4_PALLAS takes the decision from one
+            # small Pallas kernel (l4_plan_pallas; the same dict).
+            l4_plan_fn = (
+                _l4_plan_pallas.plan_pallas if _host.K32Z_L4_PALLAS else l4_split.plan
+            )
+            l4p = l4_plan_fn(
+                routing,
+                me,
+                partners=l4_partners,
+                e_total=e_total,
+                ep=ep,
+                tile_m=capacity,
+                mirror_m=_host.mirror_lanes(capacity, mirror_unit),
+                kappa=_host.K32Z_L4_KAPPA,
+                min_rows=_host.K32Z_L4_MIN_ROWS,
+            )
+            slab_row = l4_split.slab_row(
+                l4p, slab_row, pairs_g.reshape(-1), ep=ep, per_owner=t_local * topk
+            )
         # The two slab scatters and the activation all-gather are offloaded to
         # the SAME SparseCore. Ordering the scatters behind the collective
         # enqueues it 129 us earlier and costs them the cover they had; that
@@ -963,7 +1231,14 @@ def fused_ep_moe_v2(
         # smaller shape, so it is taken only where the routing plan in front
         # of the collective is longer than the scatters behind it. Same bits
         # either way; only the queue moves.
-        if not use_split_sc and t_local >= AGQ_MIN_LOCAL_TOKENS:
+        # (Step 7 O: with the token all-gather on its own core, host.TOKEN_AG_CORE,
+        # the queue is not shared and the scatters keep their cover.)
+        if (
+            not use_split_sc
+            and t_local >= AGQ_MIN_LOCAL_TOKENS
+            and not token_ag_core
+            and not sc_side
+        ):
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
         merged_scale_bits = None
         if use_split_sc:
@@ -978,7 +1253,11 @@ def fused_ep_moe_v2(
             )
         else:
             token_gather = shard_token_gather(
-                routing, me, shard_stride=ragged_stride, rows=slab_row
+                routing,
+                me,
+                shard_stride=ragged_stride,
+                rows=slab_row,
+                scatter_add=_side_scatter_add(sc_side) if sc_side else None,
             )
         if gather_positions is not None:
             # The rows were gathered in another order than the mesh's, so
@@ -1017,7 +1296,11 @@ def fused_ep_moe_v2(
                 merged_scale_bits
                 if merged_scale_bits is not None
                 else (
-                    jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
+                    _side_scatter_add(sc_side)(
+                        scale_rows * HIDDEN_LANE_BLOCK, slab_row, scale_bits
+                    )
+                    if sc_side
+                    else jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
                     .at[slab_row]
                     .add(scale_bits, mode="drop")
                 ),
@@ -1026,6 +1309,9 @@ def fused_ep_moe_v2(
         else:
             scale_slab = None
         expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
+        if l4_mode:
+            # The donor computes only the head of its hot expert.
+            expert_rows = l4_split.donor_rows(l4p, expert_rows)
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         # The bias tables are per expert and per output channel on every
         # weight format, so they take one layout: [G, N].
@@ -1050,6 +1336,43 @@ def fused_ep_moe_v2(
         # HBM->SMEM DMA at the head of the kernel, and the prefetch also has to
         # fit in 1 MB of SMEM.
         kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
+        l4_kw = {}
+        if l4_mode:
+            # The helper's tail as local expert G: visited last, its tables'
+            # row G, the transport moved between the two cores, and the
+            # kernel's L4 table (who ships what where).
+            visit = l4_split.visit_list(
+                l4p, expert_rows, _host.K32Z_L4_TAIL_POS[l4_mode]
+            )
+            counts = l4_split.counts(l4p, counts, ep=ep)
+            kernel_tables = l4_split.kernel_tables(l4p, kernel_tables, ep=ep)
+            expert_rows, slab_base = l4_split.slabs(l4p, expert_rows, slab_base)
+            l4_kw["l4_table"] = l4_split.l4_table(l4p, ep=ep)
+        if es_select:
+            # Step 11 S1 (host.K32Z_EARLY_SHIP = 2): the per-call switch rides
+            # in an extra count row. Every shard holds the same plan, so all
+            # make the same pick.
+            if _host.K32Z_ES_PALLAS:
+                # Step 12 P3: the same pick in one small Pallas kernel.
+                es_row = _es_select.early_ship_select_pallas(
+                    routing.run_rows,
+                    routing.expert_rows_aligned,
+                    ep=ep,
+                    g_local=g_local,
+                    tile_m=capacity,
+                )[0]
+            else:
+                es_row = _host.early_ship_flag_row(
+                    _host.early_ship_pick(
+                        routing.run_rows,
+                        routing.expert_rows_aligned,
+                        ep=ep,
+                        g_local=g_local,
+                        tile_m=capacity,
+                    ),
+                    ep,
+                )
+            counts = jnp.concatenate([counts, es_row], axis=0)
         arrivals, arrival_scales = kfn(
             kernel_tables,
             token_gather,
@@ -1067,6 +1390,7 @@ def fused_ep_moe_v2(
             visit=visit,
             counts=counts,
             rank=rank_l,
+            **l4_kw,
         )
 
         # The destination's own table: one arrival row per selection slot.
@@ -1088,6 +1412,9 @@ def fused_ep_moe_v2(
                 (t_local, topk),
             )
         )
+        # A row that routed nowhere read arrival rows nobody wrote; its weight is
+        # zero, but zero times an unwritten NaN is not, so it is selected away:
+        # after the combine, or inside it (fold_select), with the same bits.
         combined = _combine_arrivals(
             arrivals,
             arrival_scales,
@@ -1095,10 +1422,11 @@ def fused_ep_moe_v2(
             mirror_pos,
             topk_weights,
             out_dtype,
+            **({"routes": row_routes} if fold_select else {}),
+            **({"fuse_scales": True} if fuse_scales else {}),
         )
-        # A row that routed nowhere read arrival rows nobody wrote; its weight is
-        # zero, but zero times an unwritten NaN is not.
-        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if not fold_select:
+            combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         out = token_layout.restore(combined, ax)
         return out if updated_load is None else (out, updated_load)
 
@@ -1110,7 +1438,8 @@ def fused_ep_moe_v2(
     use_split_sc = (
         preprocess_topology is not None
         and stage == "fused"
-        and weight_format == WeightFormat.FP4
+        # K32Z stages and ships its rows exactly as FP4 does.
+        and weight_format in (WeightFormat.FP4, WeightFormat.K32Z)
         and supports_activation_gather(t_local * hidden)
         and can_scatter_pair(
             T * topk,
@@ -1132,6 +1461,14 @@ def fused_ep_moe_v2(
             bias_it,
         ) = unpack_operands(scales_gating_biases)
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
+        if quantize_first and row_scale_l is not None:
+            # Step 7 O (host.QUANTIZE_FIRST): the router reads its gate
+            # logits only after the wire rows are quantized, so the token
+            # all-gather that needs nothing else can be issued ahead of the
+            # router's ops. The same values; only the TensorCore order moves.
+            q_l, row_scale_l, gate_l = lax.optimization_barrier(
+                (q_l, row_scale_l, gate_l)
+            )
         if use_split_sc:
             from jax.experimental.compute_on import compute_on
 
@@ -1156,11 +1493,27 @@ def fused_ep_moe_v2(
                     compiler_options={"sparse_core_config": {"core_ids": [0]}},
                 )(packed).reshape(ep, layout[-1])
         else:
-            q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
+            if token_ag_core:
+                # Step 7 O (host.TOKEN_AG_CORE): the token all-gather on its
+                # own SparseCore core, so the metadata all-gather and the two
+                # slab scatters (XLA's offload, core 0) do not queue behind it;
+                # the same collective, the same bits.
+                from jax.experimental.compute_on import compute_on
+
+                q_g = compute_on(
+                    lambda p: lax.all_gather(p, ax, axis=0, tiled=True),
+                    compute_type="tpu_sparsecore",
+                    out_memory_spaces=jax.memory.Space.Device,
+                    compiler_options={
+                        "sparse_core_config": {"core_ids": [token_ag_core]}
+                    },
+                )(q_l)
+            else:
+                q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
             topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
                 gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
             )
-            exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
+            exchange = _side_all_gather(packed, ax, sc_side == 1).reshape(
                 ep, layout[-1]
             )
         return compute_local(
@@ -1207,9 +1560,15 @@ def fused_ep_moe_v2(
         )
         topk_weights = topk_weights[:t_local]
         packed = packed[:, : layout[-1]]
-        exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
-            ep, layout[-1]
-        )
+        if "disp_off" in ablation:
+            # Benchmark only: every rank's payload arrived pre-gathered, so
+            # the metadata all-gather is not run; this rank's own is its row.
+            exchange = packed.reshape(ep, layout[-1])
+            packed = lax.dynamic_slice_in_dim(exchange, rank_l[0, 0], 1, axis=0)
+        else:
+            exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
+                ep, layout[-1]
+            )
         local_blocks = packed[0, : t_local * topk].reshape(
             t_local * topk // block, block
         )
@@ -1319,6 +1678,24 @@ def fused_ep_moe_v2(
         stage,
         gather_positions,
         logical_intermediate_size,
+        k32z_gate_up_bits,
+        k32z_ffn_roll,
+        k32z_roll_from,
+        mirror_unit,
+        k32z_rungs,
+        tuple(sorted(k32z_r2.items())),
+        ablation,
+        fold_select,
+        fuse_scales,
+        quantize_first,
+        token_ag_core,
+        sc_side,
+        # Step 10 L4: the mode reads host.K32Z_L4_SPLIT at trace time, so a
+        # cached body of another mode must not be reused.
+        l4_mode,
+        early_ship,
+        # Step 11 S1: mode 2 (the in-kernel per-call switch).
+        es_select,
     )
     body, out_specs = {
         "fused": (local_fn, (P(ax), P()) if has_expert_load else P(ax)),

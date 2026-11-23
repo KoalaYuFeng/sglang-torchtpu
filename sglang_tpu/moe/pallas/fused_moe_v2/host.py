@@ -227,6 +227,49 @@ def arrival_mirror_rows(recv_rows, e_total, tile_m):
     return recv_rows // tile_m + 2 * e_total + 2
 
 
+def mirror_split(tile_m):
+    """Rows of HIDDEN_LANE_BLOCK lanes one mirror sublane is split over.
+
+    A mirror sublane holds one tile's tile_m scales. Up to one lane block it
+    is one row of a [sublanes, tile_m] array, which a transport can address a
+    row at a time. Mosaic tiles a wider f32 row (8, 128), which no transport
+    of one sublane (or of a dynamic count of them) can address, so a taller
+    tile's sublane is split over this many 128-lane rows of a 3-D
+    [sublanes, rows, 128] array whose sublane axis is untiled.
+    """
+    return max(1, tile_m // HIDDEN_LANE_BLOCK)
+
+
+# Lanes one scale-mirror sublane holds where a build asks for a fixed unit
+# below its tile height (Step 7 R1, L2): 0 keeps a sublane per tile (tile_m
+# lanes, the 3-D split above HIDDEN_LANE_BLOCK); HIDDEN_LANE_BLOCK makes a
+# 256-row K32Z tile write two 128-lane sublanes, so every mirror -- the
+# arrival one the combine gathers from included -- is [sublanes, 128] with
+# the slack of a 128-row build. Read by the layers at trace time for K32Z
+# builds and handed to the builders as mirror_unit. 128 is the default: same
+# bits, and a layer call (back to back) AZ -13 us / DZ -30 us at 1024 rows
+# per rank (Step 7 R1 opt-3); push's fused-scale combine applies again.
+K32Z_MIRROR_UNIT = 128
+
+
+def mirror_lanes(tile_m, mirror_unit=0):
+    """Lanes per mirror sublane: tile_m, or `mirror_unit` below it."""
+    if mirror_unit and tile_m > mirror_unit:
+        if tile_m % mirror_unit or mirror_unit % ROWBLK:
+            raise ValueError(
+                f"a {mirror_unit}-lane mirror unit does not divide {tile_m}-row "
+                f"tiles into whole {ROWBLK}-row blocks"
+            )
+        return mirror_unit
+    return tile_m
+
+
+def mirror_shape(sublanes, tile_m):
+    """The shape of a scale mirror of `sublanes` tile sublanes."""
+    k = mirror_split(tile_m)
+    return (sublanes, tile_m) if k == 1 else (sublanes, k, tile_m // k)
+
+
 def row_lane_blocks(hidden):
     """Lane blocks one token row is staged as: a row is (this many, 128)."""
     return hidden // HIDDEN_LANE_BLOCK
@@ -274,6 +317,10 @@ class WeightFormat(str, enum.Enum):
     FP4 = "fp4"
     INT8 = "int8"
     BF16 = "bf16"
+    # Block-32 MXFP4 experts kept lossless: the checkpoint's e2m1 codes plus
+    # per-column shift tables (see the K32Z section below). Its weights are
+    # float4 like FP4's, so it is only ever selected by name.
+    K32Z = "k32z"
 
     def __str__(self):
         return self.value
@@ -291,7 +338,8 @@ class WeightForm(NamedTuple):
 
     scale_layout is the layout of the weight scales the caller supplies:
     "per_channel" is one f32 per output channel of each matmul,
-    "per_contraction_block" one per (contraction block, output channel), and
+    "per_contraction_block" one per (contraction block, output channel),
+    "column_shift" the K32Z uint8 shift tables (k32z_table_geometry), and
     "none" is an unquantized weight that carries no scales at all.
 
     act_dtype is what token rows are staged and contracted in and act_max is
@@ -346,6 +394,9 @@ WEIGHT_FORMS = {
         WeightFormat.INT8, INT8, BF16, None, "per_channel", BF16
     ),
     WeightFormat.BF16: WeightForm(WeightFormat.BF16, BF16, BF16, None, "none", BF16),
+    WeightFormat.K32Z: WeightForm(
+        WeightFormat.K32Z, FP4, FP8, FP8_MAX, "column_shift", FP8
+    ),
 }
 
 WEIGHT_FORMAT_NAMES = tuple(WEIGHT_FORMS)
@@ -367,9 +418,12 @@ def weight_format_of_dtype(dtype):
 
     This is the one place a format is DERIVED rather than named, so it is
     also the one place the enum is constructed from something outside it;
-    everything downstream carries the member this returns.
+    everything downstream carries the member this returns. K32Z shares FP4's
+    element type and is never derived: float4 weights are FP4 unless named.
     """
     for weight_format, form in WEIGHT_FORMS.items():
+        if weight_format == WeightFormat.K32Z:
+            continue
         if jnp.dtype(form.weight_dtype) == jnp.dtype(dtype):
             return WeightFormat(weight_format)
     return None
@@ -527,9 +581,12 @@ def _refuse_bad_plan_args(T, K, *, e_total, ep, t_local, block, tile_m):
 
 
 def build_routing_tables(
-    topk_idx, *, e_total, ep, t_local, block, tile_m, shard_stride
+    topk_idx, *, e_total, ep, t_local, block, tile_m, shard_stride, mirror_m=None
 ):
-    """Assign every routed (token, expert) pair the slab row it computes on."""
+    """Assign every routed (token, expert) pair the slab row it computes on.
+
+    `mirror_m` is the scale mirror's lanes per sublane (mirror_lanes; the
+    tile height where None)."""
     # topk_idx [T, K] i32 expert ids, all-gathered. Rows order by expert then
     # by owning shard, each run padded to ROWBLK.
     T, K = topk_idx.shape
@@ -608,13 +665,14 @@ def build_routing_tables(
     # The mirror position: the pair's offset within its run, past the lane
     # its source tile's sublane starts on. Its own select-sum -- the packed
     # word above is full.
-    run_tiles = mirror_run_tiles(run_start_aligned, run_rows_aligned, tile_m)
-    shift = pow2_shift(tile_m, "tile_m")
+    mm = tile_m if mirror_m is None else mirror_m
+    run_tiles = mirror_run_tiles(run_start_aligned, run_rows_aligned, mm)
+    shift = pow2_shift(mm, "the mirror's lane count")
     rb = recv_base.transpose(1, 2, 0).reshape(e_total, ep)
     mirror_shift = (
         (jnp.right_shift(rb, shift) + 2 * jnp.arange(e_total, dtype=jnp.int32)[:, None])
-        * tile_m
-        + (run_start_aligned & (tile_m - 1))
+        * mm
+        + (run_start_aligned & (mm - 1))
         - run_start
     )
     mirror_blocks = jnp.take(mirror_shift.T, dest_of_block, axis=0)
@@ -841,8 +899,12 @@ def build_routing_tables_sharded(
     shard_stride,
     all_gather_rows=None,
     gathered=None,
+    mirror_m=None,
 ):
     """Build only the routing-plan slices consumed by shard ``me``.
+
+    ``mirror_m`` is the scale mirror's lanes per sublane (mirror_lanes; the
+    tile height where None).
 
     The replicated builder performs four one-hot passes over
     ``T * topk * e_total`` on every rank. The two large outputs are consumed
@@ -925,8 +987,9 @@ def build_routing_tables_sharded(
     # The mirror position of the same pair: its offset within the run, past
     # the lane its source tile's sublane starts on. Same shape of lookup as
     # `pos`, over the one-hot the compiler shares between them.
-    run_tiles = mirror_run_tiles(run_start_aligned, run_rows_aligned, tile_m)
-    shift = pow2_shift(tile_m, "tile_m")
+    mm = tile_m if mirror_m is None else mirror_m
+    run_tiles = mirror_run_tiles(run_start_aligned, run_rows_aligned, mm)
+    shift = pow2_shift(mm, "the mirror's lane count")
     my_run_start = lax.dynamic_slice(run_start_aligned, (0, me), (e_total, 1)).reshape(
         e_total
     )
@@ -937,8 +1000,8 @@ def build_routing_tables_sharded(
                 jnp.right_shift(my_recv_base, shift)
                 + 2 * jnp.arange(e_total, dtype=jnp.int32)
             )
-            * tile_m
-            + (my_run_start & (tile_m - 1))
+            * mm
+            + (my_run_start & (mm - 1))
         )[None, :]
     )
     mirror_pos = (_lookup_per_pair(mirror_table, my_blocks, bins) + my_rank).reshape(
@@ -1015,7 +1078,7 @@ def local_slab_rows(routing, me, *, shard_stride):
     )
 
 
-def shard_token_gather(routing, me, *, shard_stride, rows=None):
+def shard_token_gather(routing, me, *, shard_stride, rows=None, scatter_add=None):
     """The token number each of shard `me`'s slab rows computes, [stride].
 
     `rows` is the destination slab row of each routed pair, which is derived
@@ -1051,9 +1114,16 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
         else rows
     )
     gather_lo, gather_hi = gather_clamp_bounds(T)
-    scattered = (
-        jnp.zeros((shard_stride,), jnp.int32).at[row].add(token_of_pair, mode="drop")
-    )
+    if scatter_add is not None:
+        # Step 7 O: the same scatter-add, placed by the caller (SparseCore
+        # core 1, layer host.SC_SIDE_CORE).
+        scattered = scatter_add(shard_stride, row, token_of_pair)
+    else:
+        scattered = (
+            jnp.zeros((shard_stride,), jnp.int32)
+            .at[row]
+            .add(token_of_pair, mode="drop")
+        )
     return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
 
 
@@ -1185,6 +1255,9 @@ COUNT_SEND_MIRROR = 5
 COUNT_RECV_MIRROR = 6
 COUNT_SELF_MIRROR = 7
 N_COUNTS = 8
+# Step 11 S1: a K32Z_EARLY_SHIP = 2 build appends one row to the count table,
+# whose lane 0 is the per-call early-ship switch (early_ship_flag_row).
+COUNT_ES_FLAG = N_COUNTS
 
 
 def shard_count_vector(routing, expert_rows, me, *, e_total, ep):
@@ -1376,6 +1449,689 @@ def check_u32_sublane_tile(info=None):
         )
 
 
+# --------------------------------------------------------------------------- #
+# K32Z: block-32 MXFP4 experts kept lossless (DeepSeek-V4.1). The operands are
+# built by sglang_tpu/dsv4_mxfp4_k32z.py; this mirrors its layout.
+#
+# The e2m1 codes stream as packed u32 words exactly as FP4's do. Per output
+# column n there is a base exponent b, the minimum over the column's K groups
+# of 32 rows, and per (group g, column n) a shift d = e - b in a `bits`-wide
+# uint8 field: byte (g, (T // F) * 128 + l) at bit bits * (T % F), for column
+# tile T = n // 128, lane l = n % 128 and F = 8 // bits fields per byte. The
+# base bytes ride in the down table's padding rows: row G2 + T % 2 holds the
+# down bases of column tile T, row G2 + 2 + T % 2 the gate/up bases, both at
+# byte columns (T // 2) * 128 + l. The kernel converts a block of codes to
+# e5m2 (exact), adds 4 * d to every byte (d to the exponent field), contracts
+# it and applies the column scale 2^(b - 127) once after the K sum.
+# --------------------------------------------------------------------------- #
+K32Z_GROUP = 32  # K rows per checkpoint exponent, so per shift field
+K32Z_LANE_TILE = 128  # columns per shift-field tile
+K32Z_U8_SUBLANE_TILE = 32  # a uint8 table pads its rows to this
+K32Z_BASE_ROWS = 4  # down bases (even/odd tiles), then gate/up bases
+K32Z_GATE_UP_BITS = (2, 4)  # the gate/up field widths a build takes
+K32Z_DOWN_BITS = 4
+# A decoded block is [K32Z_KBLOCK, K32Z_CHUNK] e5m2: one output chunk of 256
+# columns over 512 contraction rows (the last block of a matmul may be 256).
+K32Z_CHUNK = 256
+K32Z_KBLOCK = 512
+# K32Z tile heights are whole multiples of this (and so is a K32Z tile_m).
+K32Z_RUNG_STEP = 32
+# The tile heights a K32Z build emits below tile_m, which is always the top
+# one. Each is another copy of the FFN body in the program, and a K32Z body
+# (its decode unrolled over every block) is large: with all eight multiples
+# of 32 up to 256 the program outgrew the TensorCore's instruction memory
+# [hyp] and a visit took about 8x longer (Step 7 N2a, one V4.1 layer: 1564
+# vs 216 us per call at 8 rows per rank), while four bodies measured fine.
+# 128 is the default ladder's streamed height (K32Z_STREAMED_ROWS): where a
+# visit's slab waits move from the readers to its head. A ladder without it
+# streams up to its tallest rung below 128 instead (k32z_streamed_rows).
+K32Z_RUNGS = (32, 64, 128)
+# The ladder production builds take; a build whose layer is traced with
+# another K32Z_RUNGS (Step 7 R1, L3) gets it as k32z_rungs, keyed and named.
+K32Z_DEFAULT_RUNGS = K32Z_RUNGS
+# A rung body of up to this many rows waits each weight slab in the block
+# that first reads it, as FP4 does. A visit whose first tile is taller waits
+# both slabs at its head, before the tile loop, so its bodies hold no waits.
+K32Z_STREAMED_ROWS = 128
+# How a K32Z FFN body walks its K32Z_CHUNK-column output chunks. 0 unrolls
+# every chunk: each rung body then carries one decode per block, 280 at
+# V4.1's shape (18 gate/up chunks x 10 blocks, 20 down chunks x 5), and the
+# program carried instruction-overlay waits (Step 7 N3a: 9.7 us a call back
+# to back at 8-16 rows per rank). u > 0 runs the chunks in a loop of u
+# chunks a step through an f32 accumulator scratch (acc_vm): the same block
+# products summed in the same order, so the same bits, from u chunks'
+# decode text per matmul. The layers read this at trace time (with the rule
+# below, host.k32z_roll_plan) and hand it to the builders as k32z_ffn_roll;
+# None leaves the choice to K32Z_DECODE_ROLL.
+K32Z_FFN_ROLL = None
+# The lowest tile height whose body takes the loop when K32Z_FFN_ROLL is on;
+# lower rungs keep the unrolled body (0: every rung loops). A looped body
+# exposes ~0.12 us per loop step (Step 7 R1 opt-1: AZr1 +171 us a call at 8
+# rows per rank), so only rungs a bucket rarely runs can afford it, and the
+# program then carries their small text instead of their unrolled one.
+K32Z_FFN_ROLL_FROM = 0
+# With K32Z_FFN_ROLL left at None, a decode build -- every expert expected
+# inside the first rung, ragged rows <= ep * g_local * K32Z_DEFAULT_RUNGS[0]
+# -- takes this (roll, lowest looped height), and every other build the
+# unrolled bodies. None turns the rule off. (2, 64) (Step 7 R1 opt-2): the 32
+# body stays unrolled and 64/128/256, which a decode bucket runs only for a
+# hot expert, loop two chunks a step; the program drops ~1.7 MB of text and
+# its overlay waits (back-to-back AZ -21.5 us, DZ -24.2 us at 8 rows per
+# rank), but at 64 rows real routing the looped 64 body cost AZ +5.5 us of
+# kernel. (2, 128) (Step 7 R2): the 64 body unrolled too (+0.46 MB, still no
+# overlay waits at 8-64 rows per rank): 64 rows real routing AZ -6.5 / DZ -5.5
+# us back to back, every other decode point within +-0.4 us (8 real: the
+# host-limited session), bit for bit the same output.
+K32Z_DECODE_ROLL = (2, 128)
+# Step 9 (K9). The output chunks a decode build's looped body walks per loop
+# step, as (gate/up, down) -- each must divide its matmul's chunk count (18 /
+# 20 at V4.1's shape); None: K32Z_DECODE_ROLL's count for both. A step is
+# one basic block, so a longer step overlaps more decode with MXU work at a
+# few chunks' more text; the same block products summed in the same order
+# either way, so bit for bit the same output. Read at trace time with
+# K32Z_DECODE_ROLL (k32z_roll_plan). Step 10 (L1): (3, 4) by default, as
+# measured on EP8 in K9 (layer 3 / 20 real text, back-to-back period -1.4 /
+# -2.2 us at 32 rows per rank, -3.7 / -4.3 at 64; +0.113 MB of program
+# text; 512+ rows per rank build the same program). A shape whose chunk
+# counts the pair does not divide takes K32Z_DECODE_ROLL's count instead,
+# where the caller names the shape (k32z_roll_plan's hidden / inter).
+K32Z_DECODE_STEP = (3, 4)
+# Step 7 R2 (K1). The rung heights whose bodies loop when a build loops at
+# all (k32z_ffn_roll > 0), in place of K32Z_FFN_ROLL_FROM's "this height and
+# up": a large bucket can then loop the low rungs it rarely runs and keep its
+# tile_m body unrolled. None: K32Z_FFN_ROLL_FROM decides. A benchmark knob,
+# read with K32Z_FFN_ROLL at trace time (k32z_build_plan).
+K32Z_ROLL_RUNGS = None
+# Step 7 R2 (K1). A large K32Z build -- ragged rows > ep * g_local *
+# K32Z_LARGE_FROM, so its experts are expected to outgrow a 128-row tile:
+# 1024+ rows per rank at EP8 with 48 local experts -- takes the entries of
+# this dict over the defaults below: "rungs" (heights below tile_m, in place
+# of K32Z_RUNGS), "roll" ((u, heights): loop those rung bodies u chunks a
+# step), "push_from_vmem_rows", "defer_push". None: a
+# large build is built as every other. A tuple of (rows per expert, dict)
+# tiers instead applies the tallest tier the build exceeds (a build expecting
+# more than that many rows per expert: ragged rows > ep * g_local * rows).
+K32Z_LARGE_FROM = 128
+# The kept plan (Step 7 R2, layer 3, back-to-back period, uniform / real):
+# - > 128 rows per expert (1024 rows per rank): no 32 rung (64/128/256: three
+#   bodies, and the 19.6 us instruction-overlay wait per call is gone), A's
+#   push-from-VMEM bound (two-hop return, as A) and the deferred drain/push:
+#   -10.6 / -88.6 us vs the k32z-r1 build (-18.6 / -19.0 from the rungs).
+# - > 256 rows per expert (2048): no 64 rung (32/128/256; the 24.9 us wait is
+#   gone) and the deferred drain/push: -16.9 / -38.1 us.
+# Every tier is bit-for-bit the k32z-r1 output (same rows, same sums).
+K32Z_LARGE_PLAN = (
+    (128, {"rungs": (64, 128), "push_from_vmem_rows": 128, "defer_push": True}),
+    (256, {"rungs": (32, 128), "defer_push": True}),
+)
+
+
+def k32z_large_tier(rows_alloc, ep, g_local, plan=None):
+    """The K32Z_LARGE_PLAN entries a build of `rows_alloc` ragged rows takes
+    (`plan` in place of the module's): {} below every tier."""
+    plan = K32Z_LARGE_PLAN if plan is None else plan
+    if not plan:
+        return {}
+    tiers = ((K32Z_LARGE_FROM, plan),) if isinstance(plan, dict) else tuple(plan)
+    taken = {}
+    for rows, entries in sorted(tiers, key=lambda tier: tier[0]):
+        if rows_alloc > ep * g_local * rows:
+            taken = dict(entries)
+    return taken
+
+
+# Step 7 R2 (K1). The tile height a K32Z build's push-from-VMEM bound counts
+# in (the kernel ships tiles straight from out_vm where ragged rows <= ep *
+# g_local * this). None: the build's tile_m. 128 gives a 256-row K32Z build
+# the bound a 128-row K512 build has, so 1024 rows per rank commits through
+# the contribution slab and pushes per expert run (the two-hop path), as A.
+PUSH_FROM_VMEM_ROWS = None
+# Step 7 R2 (K1). A two-hop K32Z build drains an expert's last commits and
+# pushes its runs one tile into the NEXT visit (after that tile's FFN),
+# instead of at the end of its own visit, so the last tile's commit lands
+# under compute rather than in front of the next visit.
+DEFER_PUSH = False
+# Step 7 K2f. The all-gather build's combine zeroes the rows of tokens that
+# routed nowhere inside its kernel (one route flag per token in scalar
+# prefetch; the push path's fold_select) instead of in a select after it,
+# where the combine kernel applies (kernel.combine_step_tokens); the same
+# bits. Read at trace time. None (the default since Step 7 K3): on for a
+# K32Z build where the combine kernel applies, off for every other build
+# (K512, and K32Z below kernel.COMBINE_MIN_TOKENS rows per rank), which keep
+# their programs; True / False force it (False builds k32z-r2's program).
+COMBINE_FOLD_SELECT = None
+# Step 7 O. The all-gather build's combine runs the arrival-scale lookup
+# inside its kernel (kernel._build_combine_kernel's fuse_scales, as push's
+# combine does: mirror, mirror positions and router weights in scalar
+# prefetch) instead of an XLA gather of the row scales in front of it, where
+# the combine kernel applies and the scale mirror is at most one lane block
+# wide (K32Z's 128-lane mirror unit); the same bits. Read at trace time.
+# None: the per-build default below (combine_fuse_scales); True / False
+# force it.
+COMBINE_FUSE_SCALES = None
+# The local rows per rank at which a K32Z all-gather build takes it by
+# default; every other build keeps its program. 2048 (the all-gather build's
+# bucket): V4.1 Flash EP8 on TPU v7x, layer 3, back-to-back period -41.8 /
+# -41.2 us uniform / real (Step 7 O R1), the post-kernel row-scale gather
+# (47.9 us) gone, bitwise.
+COMBINE_FUSE_SCALES_TOKENS = (2048,)
+
+
+def combine_fuse_scales(value, *, k32z, t_local):
+    """Whether an all-gather build fuses the arrival-scale lookup into its
+    combine kernel: `value` (host.COMBINE_FUSE_SCALES) where set, else on for
+    K32Z builds at COMBINE_FUSE_SCALES_TOKENS local rows per rank."""
+    if value is None:
+        return bool(k32z) and t_local in COMBINE_FUSE_SCALES_TOKENS
+    return bool(value)
+
+
+# Step 7 O. The all-gather build quantizes its wire rows ahead of the router
+# (an optimization barrier hands the router its gate logits only with the
+# quantized rows), so the token all-gather, which needs nothing else, is
+# issued before the router's ops; the same values. Read at trace time.
+# None: the per-build default below (quantize_first); True / False force it.
+QUANTIZE_FIRST = None
+# The local rows per rank at which a K32Z all-gather build takes it by
+# default; every other build keeps its program.
+QUANTIZE_FIRST_TOKENS = ()
+
+
+def quantize_first(value, *, k32z, t_local):
+    """Whether an all-gather build quantizes ahead of its router: `value`
+    (host.QUANTIZE_FIRST) where set, else on for K32Z builds at
+    QUANTIZE_FIRST_TOKENS local rows per rank."""
+    if value is None:
+        return bool(k32z) and t_local in QUANTIZE_FIRST_TOKENS
+    return bool(value)
+
+
+# Step 7 O. The SparseCore core the all-gather build's token all-gather runs
+# on (outside the split-SparseCore path): 0 = XLA's own offload, which shares
+# core 0's queue with the metadata all-gather and the two slab scatters (so
+# at >= AGQ_MIN_LOCAL_TOKENS the scatters wait behind it); 1 = that
+# collective on core 1 (compute_on), where the scatters keep their cover and
+# the ordering barrier is dropped; the same bits. Read at trace time. None:
+# the per-build default below (token_ag_core).
+TOKEN_AG_CORE = None
+# The local rows per rank at which a K32Z all-gather build takes core 1 by
+# default; every other build keeps its program.
+TOKEN_AG_CORE_TOKENS = ()
+
+
+def token_ag_core(value, *, k32z, t_local):
+    """The token all-gather's SparseCore core for an all-gather build: `value`
+    (host.TOKEN_AG_CORE) where set, else 1 for K32Z builds at
+    TOKEN_AG_CORE_TOKENS local rows per rank and 0 everywhere else."""
+    if value is None:
+        return 1 if (k32z and t_local in TOKEN_AG_CORE_TOKENS) else 0
+    value = int(value)
+    if value not in (0, 1):
+        raise ValueError(f"TOKEN_AG_CORE is 0 or 1; got {value}")
+    return value
+
+
+# Step 7 O. The all-gather build's side SparseCore work on SparseCore core 1
+# (compute_on), off core 0's queue, which holds XLA's token all-gather
+# (outside the split-SparseCore path): 1 = the metadata all-gather and the
+# two slab scatters, 2 = the two slab scatters only; the ordering barrier
+# behind the token all-gather is dropped. The same collectives and integer
+# scatter-adds, the same bits. Read at trace time. None: the per-build
+# default below (sc_side_core); 0 / False: off.
+SC_SIDE_CORE = None
+# The local rows per rank at which a K32Z all-gather build takes
+# SC_SIDE_CORE_DEFAULT by default; every other build keeps its program. 2048
+# with mode 2: V4.1 Flash EP8 on TPU v7x, layer 3, back-to-back period -19.0
+# / -18.5 us uniform / real on top of COMBINE_FUSE_SCALES (Step 7 O R4c), the
+# scatters (14.1 us of waits) behind the token all-gather now under it. Mode
+# 1 lost +32.6 us: the metadata all-gather on core 1 overlaps the token
+# all-gather and takes 352.7 us on the shared links.
+SC_SIDE_CORE_TOKENS = (2048,)
+SC_SIDE_CORE_DEFAULT = 2
+
+
+def sc_side_core(value, *, k32z, t_local):
+    """The all-gather build's side-work mode (0 off, 1 metadata all-gather +
+    scatters, 2 scatters only on SparseCore core 1): `value`
+    (host.SC_SIDE_CORE) where set, else SC_SIDE_CORE_DEFAULT for K32Z builds
+    at SC_SIDE_CORE_TOKENS local rows per rank and 0 elsewhere."""
+    if value is None:
+        return SC_SIDE_CORE_DEFAULT if (k32z and t_local in SC_SIDE_CORE_TOKENS) else 0
+    value = int(value)
+    if value not in (0, 1, 2):
+        raise ValueError(f"SC_SIDE_CORE is 0, 1 or 2; got {value}")
+    return value
+
+
+# Step 10 L4. The hot expert's rows split with the sibling TensorCore of the
+# same chip, decided at run time from the routing counts (l4_split): the
+# heavier core of a chip pair (the donor) keeps rows [0, a) of its most-rows
+# expert, the other core (the helper) computes rows [a, n) as a 49th local
+# expert, with that expert's weights copied on chip inside the kernel, and
+# returns them to the arrival rows the donor would have used; the same bits.
+# It moves expert work across ranks, so its gain is reported apart from the
+# kernel's own (Step 8 rule). Read at trace time. None / 0: off (every program
+# unchanged); 1 / 2 / 3: the chip pair of the busiest rank, the tail visited
+# on the helper last / second (after its biggest own expert) / first (behind
+# the weight copy). The modes differ only in the visit table: one kernel.
+# Applies to K32Z all-gather builds at K32Z_L4_TOKENS local rows only.
+K32Z_L4_SPLIT = None
+K32Z_L4_TOKENS = (2048,)
+# The decision's load model, in aligned rows: an expert with rows > 0 costs
+# max(K32Z_L4_KAPPA, rows) (its weight stream is ~125 rows of 256-row tiles);
+# no split under K32Z_L4_MIN_ROWS rows for the helper.
+K32Z_L4_KAPPA = 128
+K32Z_L4_MIN_ROWS = 512
+# Mode -> the tail's visit position on the helper (None: after its own experts).
+# Mode 4 is mode 1 with the tail shipping each run two tiles after the tile
+# that completes it (kernel l4_stream) instead of all at its visit's end.
+K32Z_L4_TAIL_POS = {1: None, 2: 1, 3: 0, 4: None}
+K32Z_L4_STREAM_MODES = (4,)
+# Step 10 follow-up, a kernel-only return-path change (no work moves across
+# ranks): on a K32Z all-gather two-hop build at K32Z_EARLY_SHIP_TOKENS local
+# rows, every own expert ships each (expert, dest) run two tiles after the
+# tile that completes it (its commits are then landed) instead of all its runs
+# at its visit's end; L4 mode 4 does this for the helper's tail. The same
+# DMAs and totals, the same bits. Read at trace time. None / 0: off; 1: always;
+# K32Z_ES_SELECT: per call (early_ship_pick). Default K32Z_ES_SELECT since Step 12 I
+# (the S1 selector, XLA pick: 20-layer gate, bitwise, sum -464.0 us vs AZ, worst
+# layer +0.33 %; results/step11/s1); 0 builds the pre-S1 AZ program.
+K32Z_EARLY_SHIP = 2
+K32Z_EARLY_SHIP_TOKENS = (2048,)
+# Step 11 S1: mode 2 switches early shipping per call inside one kernel
+# (early_ship_flag; a lax.cond between two kernels cost +15 to +20 us per call
+# on chip, results/step11/s1) from a plan model of the busiest rank's return
+# tail (results/step11/s1,
+# PREREG.md): every rank visits its experts back to back, most rows first, a
+# visit of R aligned rows taking max(W, A * R) us; visit k's runs leave after
+# visit k + 1's first tile (defer_push); each directed ICI link of the 2 x 2
+# chip grid serves B us per true row in release order. X = the latest link
+# finish minus the busiest rank's compute end; early shipping iff X > THETA.
+# A / B / THETA were fitted on six layers' measurements (EP8, 2048 rows/rank,
+# real text); W is the K8 M_e sweep's per-expert weight-stream floor.
+K32Z_ES_SELECT = 2
+K32Z_ES_A_US = 0.0402
+K32Z_ES_B_US = 0.05553
+K32Z_ES_W_US = 5.44
+K32Z_ES_THETA_US = 171.5
+# The model's chips in shard order: shard d on chip d // 2 at these (x, y)
+# coordinates, routes x first. Only an EP8 build (four two-core chips) selects.
+K32Z_ES_CHIP_XY = ((0, 0), (1, 0), (0, 1), (1, 1))
+# Step 12 P3: a mode 2 build computes the pick (and the flag row) in one small
+# Pallas kernel (es_select.early_ship_select_pallas) instead of XLA. Read at
+# trace time. None / 0: the XLA pick (unchanged); 1: the Pallas kernel.
+K32Z_ES_PALLAS = None
+# Step 12 P3: an L4 build (K32Z_L4_SPLIT) takes l4_split.plan's decision from one
+# small Pallas kernel (l4_plan_pallas.plan_pallas, the same dict) when set.
+# Read at trace time. None / 0: the XLA plan (unchanged).
+K32Z_L4_PALLAS = None
+
+
+def early_ship_mode(value, *, k32z, t_local):
+    """Whether an all-gather build always ships its runs early (host.K32Z_EARLY_SHIP)."""
+    return (
+        bool(value)
+        and value != K32Z_ES_SELECT
+        and bool(k32z)
+        and t_local in K32Z_EARLY_SHIP_TOKENS
+    )
+
+
+def early_ship_select(value, *, k32z, t_local, ep):
+    """Whether an all-gather build picks early shipping per call (mode 2)."""
+    return (
+        value == K32Z_ES_SELECT
+        and bool(k32z)
+        and t_local in K32Z_EARLY_SHIP_TOKENS
+        and ep == 2 * len(K32Z_ES_CHIP_XY)
+    )
+
+
+def early_ship_link_incidence(ep):
+    """[links][src][dst] 0 / 1: whether the push src -> dst crosses each
+    directed ICI link of K32Z_ES_CHIP_XY (x first; one chip's two shards and
+    an own-rank hop cross none)."""
+    xy = K32Z_ES_CHIP_XY
+    chip_of = {c: i for i, c in enumerate(xy)}
+    links = [
+        (a, b)
+        for a in range(len(xy))
+        for b in range(len(xy))
+        if abs(xy[a][0] - xy[b][0]) + abs(xy[a][1] - xy[b][1]) == 1
+    ]
+    inc = [[[0] * ep for _ in range(ep)] for _ in links]
+    for s in range(ep):
+        for d in range(ep):
+            cur, dst = list(xy[s // 2]), xy[d // 2]
+            for axis in (0, 1):
+                while cur[axis] != dst[axis]:
+                    nxt = list(cur)
+                    nxt[axis] += 1 if dst[axis] > cur[axis] else -1
+                    inc[links.index((chip_of[tuple(cur)], chip_of[tuple(nxt)]))][s][d] = 1
+                    cur = nxt
+    return inc
+
+
+def early_ship_tail_us(run_rows, expert_rows_aligned, *, ep, g_local, tile_m):
+    """The selector's X in us (f32 scalar) from the replicated plan.
+
+    run_rows [E, ep] true rows per (expert, dest shard); expert_rows_aligned
+    [E]. No sort: the visit order is a g_local-square compare per shard and
+    each link's finish a pairwise compare of the release times.
+    """
+    f32 = jnp.float32
+    rows = expert_rows_aligned.reshape(ep, g_local).astype(f32)
+    live = rows > 0
+    dur = jnp.where(
+        live, jnp.maximum(f32(K32Z_ES_W_US), f32(K32Z_ES_A_US) * rows), f32(0)
+    )
+    idx = jnp.arange(g_local, dtype=jnp.int32)
+    r_g, r_h = rows[:, :, None], rows[:, None, :]
+    # before[s, g, h]: shard s visits h before g (rows descending, then index).
+    before = jnp.logical_and(
+        jnp.logical_or(
+            r_h > r_g,
+            jnp.logical_and(r_h == r_g, idx[None, None, :] < idx[None, :, None]),
+        ),
+        live[:, None, :],
+    )
+    start = jnp.sum(jnp.where(before, dur[:, None, :], f32(0)), axis=2)
+    pos = jnp.sum(before.astype(jnp.int32), axis=2)
+    first = dur * jnp.minimum(rows, f32(tile_m)) / jnp.maximum(rows, f32(1))
+    nxt = jnp.logical_and(pos[:, None, :] == pos[:, :, None] + 1, live[:, None, :])
+    # defer_push: g's runs leave after the next visit's first tile; the last
+    # visit's at the shard's compute end.
+    rel = (start + dur + jnp.sum(jnp.where(nxt, first[:, None, :], f32(0)), axis=2))
+    comp_end = jnp.max(jnp.sum(dur, axis=1))
+    inc = jnp.asarray(early_ship_link_incidence(ep), jnp.int32)  # [l, s, d]
+    rr = run_rows.reshape(ep, g_local, ep).astype(jnp.int32)  # [s, g, d]
+    w = jnp.sum(inc[:, :, None, :] * rr[None], axis=3).reshape(inc.shape[0], -1)
+    rel = rel.reshape(-1)
+    later = rel[None, :] >= rel[:, None]  # [i, j]: j released at or after i
+    suffix = jnp.sum(jnp.where(later[None], w[:, None, :], 0), axis=2)  # [l, i]
+    fin = jnp.where(
+        w > 0, rel[None, :] + f32(K32Z_ES_B_US) * suffix.astype(f32), -jnp.inf
+    )
+    return jnp.max(fin) - comp_end
+
+
+def early_ship_pick(run_rows, expert_rows_aligned, *, ep, g_local, tile_m):
+    """Mode 2's per-call choice: early shipping iff X > K32Z_ES_THETA_US."""
+    return (
+        early_ship_tail_us(
+            run_rows, expert_rows_aligned, ep=ep, g_local=g_local, tile_m=tile_m
+        )
+        > K32Z_ES_THETA_US
+    )
+
+
+# Step 11 E1, the push path's counterpart (a kernel-only return-path change, no work
+# moves): with K32Z_PUSH_EARLY_SHIP on, a K32Z push build at a bucket listed in
+# K32Z_PUSH_EARLY_SHIP_MODES (local rows per rank -> push option early_ship) takes
+# that mode when its caller leaves early_ship unset. On by default at 1024 only:
+# mode 3 ships each return run two tiles after the tile that completes it, in each
+# rank's last two visits only (Step 12 V, 8 layers, bitwise: L3 -8.7 % of period,
+# worst +0.23 %). 512's mode 1 (every visit) is not a default: it failed the same
+# 8-layer check (L24 +0.57 %); an explicit early_ship=1 still builds it. Every other
+# bucket keeps early_ship 0. The same DMAs, so the same bits. Read at trace time.
+# None / 0: off (every program the pre-E1 one).
+K32Z_PUSH_EARLY_SHIP = 1
+K32Z_PUSH_EARLY_SHIP_MODES = {1024: 3}
+
+
+def push_early_ship_mode(value, *, k32z, t_local):
+    """The push option early_ship a push build takes when its caller left it unset
+    (host.K32Z_PUSH_EARLY_SHIP; 0: off)."""
+    if not value or not k32z:
+        return 0
+    return int(K32Z_PUSH_EARLY_SHIP_MODES.get(t_local, 0))
+
+
+# Step 12 P2 / I: a K32Z push build at K32Z_PUSH_SLAB_ROWS_TOKENS local rows per
+# rank takes the push option exchange_slab_rows (the plan's per-pair slab rows from
+# the exchange-table kernel) when its caller leaves it unset. On by default (P2,
+# layer 3 real text, bitwise: pre segment -1.0 / -1.4 us at 8 / 64). It applies on
+# the exchange-table plan path without x_tables only (8-256 here; 512 / 1024 take
+# x_tables). None / 0: off (the pre-P2 program); an explicit option wins.
+K32Z_PUSH_SLAB_ROWS = 1
+K32Z_PUSH_SLAB_ROWS_TOKENS = (8, 16, 32, 64, 128, 256)
+
+
+def push_slab_rows_mode(value, *, k32z, t_local):
+    """The push option exchange_slab_rows a push build takes when its caller left
+    it unset (host.K32Z_PUSH_SLAB_ROWS)."""
+    return bool(value) and bool(k32z) and t_local in K32Z_PUSH_SLAB_ROWS_TOKENS
+
+
+def early_ship_flag_row(pick, ep):
+    """The count table's COUNT_ES_FLAG row, [1, ep] i32: the pick in lane 0."""
+    lane0 = (jnp.arange(ep, dtype=jnp.int32) == 0).astype(jnp.int32)
+    return (pick.astype(jnp.int32) * lane0)[None, :]
+
+
+def l4_split_mode(value, *, k32z, t_local):
+    """The L4 mode of an all-gather build: `value` (host.K32Z_L4_SPLIT) for
+    K32Z builds at K32Z_L4_TOKENS local rows per rank, 0 everywhere else."""
+    if not value or not k32z or t_local not in K32Z_L4_TOKENS:
+        return 0
+    value = int(value)
+    if value not in K32Z_L4_TAIL_POS:
+        raise ValueError(
+            f"K32Z_L4_SPLIT is None, 0 or one of {tuple(K32Z_L4_TAIL_POS)}; got {value}"
+        )
+    return value
+
+
+def k32z_streamed_rows(height_rungs):
+    """The tallest rung a K32Z build streams its weight slabs into: the
+    tallest of `height_rungs` up to K32Z_STREAMED_ROWS (0 where none is).
+    A visit whose rows exceed it waits both slabs at its head; bodies up to
+    it wait each slab in the block that first reads it. The default ladder
+    gives K32Z_STREAMED_ROWS itself."""
+    return max((r for r in height_rungs if r <= K32Z_STREAMED_ROWS), default=0)
+
+
+def k32z_step_applies(step, hidden, inter):
+    """False only where a (gate/up, down) loop step of positive counts does
+    not divide its matmul's output chunk count at this shape; anything else
+    goes on to check_k32z_ffn_roll, which refuses a bad pair by name."""
+    up, down = (int(u) for u in step)
+    if up <= 0 or down <= 0:
+        return True
+    return (2 * inter // K32Z_CHUNK) % up == 0 and (hidden // K32Z_CHUNK) % down == 0
+
+
+def k32z_roll_plan(rows_alloc, ep, g_local, hidden=None, inter=None):
+    """(k32z_ffn_roll, k32z_roll_from) a K32Z build takes at trace time.
+
+    K32Z_FFN_ROLL = u > 0 forces u (with K32Z_FFN_ROLL_FROM), 0 forces the
+    unrolled bodies, and None (the default) applies K32Z_DECODE_ROLL to
+    decode builds only, walking K32Z_DECODE_STEP chunks a step where it is
+    set and, given the shape (`hidden`, `inter`), divides its chunk counts."""
+    roll = K32Z_FFN_ROLL
+    if roll is None:
+        rule = K32Z_DECODE_ROLL
+        # The default ladder's first rung: a benchmark ladder (K32Z_RUNGS,
+        # possibly empty) does not move which builds count as decode.
+        if rule and rows_alloc <= ep * g_local * K32Z_DEFAULT_RUNGS[0]:
+            if K32Z_DECODE_STEP is not None:
+                step = tuple(int(u) for u in K32Z_DECODE_STEP)
+                if hidden is None or k32z_step_applies(step, hidden, inter):
+                    return (step if step[0] != step[1] else step[0]), int(rule[1])
+            return int(rule[0]), int(rule[1])
+        return 0, 0
+    return (int(roll), int(K32Z_FFN_ROLL_FROM)) if roll else (0, 0)
+
+
+def k32z_roll_steps(roll):
+    """(gate/up, down) output chunks per loop step of a looped K32Z body:
+    `roll` is one count for both or a (gate/up, down) pair (Step 9)."""
+    if isinstance(roll, tuple):
+        return int(roll[0]), int(roll[1])
+    return int(roll), int(roll)
+
+
+def k32z_roll_tag(roll):
+    """`roll` as it appears in a program name: "2", or "3x4" for a pair."""
+    if isinstance(roll, tuple):
+        return f"{int(roll[0])}x{int(roll[1])}"
+    return str(int(roll))
+
+
+def check_k32z_ffn_roll(roll, hidden, inter):
+    """`roll` as an int (or, Step 9, a (gate/up, down) pair of ints) a K32Z
+    build at this shape can take; raises naming why not. Each matmul's chunk
+    count must be a whole multiple of its count."""
+    pair = isinstance(roll, (tuple, list))
+    parts = tuple(roll) if pair else (roll,)
+    if (
+        len(parts) not in ((2,) if pair else (1,))
+        or any(isinstance(u, bool) or int(u) != u or u < 0 for u in parts)
+        or (pair and not all(int(u) > 0 for u in parts))
+    ):
+        raise ValueError(
+            f"k32z_ffn_roll is a chunk count >= 0 or a (gate/up, down) pair of "
+            f"counts > 0; got {roll!r}"
+        )
+    steps = tuple(int(u) for u in parts) * (1 if pair else 2)
+    for (what, n_out), u in zip((("gate/up", 2 * inter), ("down", hidden)), steps):
+        if u and (n_out // K32Z_CHUNK) % u:
+            raise ValueError(
+                f"k32z_ffn_roll {roll} does not divide the {what} matmul's "
+                f"{n_out // K32Z_CHUNK} output chunks"
+            )
+    if pair:
+        return steps if steps[0] != steps[1] else steps[0]
+    return steps[0]
+
+
+# The K32Z build choices k32z_build_plan returns, with the builders' defaults.
+K32Z_PLAN_DEFAULTS = {
+    "k32z_rungs": None,
+    "k32z_ffn_roll": 0,
+    "k32z_roll_from": 0,
+    "k32z_roll_rungs": None,
+    "push_from_vmem_rows": None,
+    "defer_push": False,
+}
+
+
+def k32z_build_plan(rows_alloc, ep, g_local, hidden=None, inter=None):
+    """The K32Z build choices a layer takes at trace time, as the builders'
+    keyword arguments (keys of K32Z_PLAN_DEFAULTS).
+
+    The module knobs as k32z_roll_plan and the R2 knobs read them; then a
+    large build takes its K32Z_LARGE_PLAN tier's entries over them
+    (k32z_large_tier). k32z_rungs is None wherever the ladder is the default
+    one, so a default build keeps its name."""
+    roll, roll_from = k32z_roll_plan(rows_alloc, ep, g_local, hidden, inter)
+    plan = dict(K32Z_PLAN_DEFAULTS)
+    plan["k32z_rungs"] = (
+        None if tuple(K32Z_RUNGS) == K32Z_DEFAULT_RUNGS else tuple(K32Z_RUNGS)
+    )
+    plan["k32z_ffn_roll"], plan["k32z_roll_from"] = roll, roll_from
+    if roll and K32Z_ROLL_RUNGS is not None:
+        plan["k32z_roll_rungs"] = tuple(sorted({int(h) for h in K32Z_ROLL_RUNGS}))
+    plan["push_from_vmem_rows"] = (
+        None if PUSH_FROM_VMEM_ROWS is None else int(PUSH_FROM_VMEM_ROWS)
+    )
+    plan["defer_push"] = bool(DEFER_PUSH)
+    large = k32z_large_tier(rows_alloc, ep, g_local)
+    if large:
+        for key, value in large.items():
+            if key == "rungs":
+                rungs = tuple(int(r) for r in value)
+                plan["k32z_rungs"] = None if rungs == K32Z_DEFAULT_RUNGS else rungs
+            elif key == "roll":
+                if value:
+                    u, heights = value
+                    plan["k32z_ffn_roll"], plan["k32z_roll_from"] = int(u), 0
+                    plan["k32z_roll_rungs"] = tuple(sorted({int(h) for h in heights}))
+                else:
+                    plan["k32z_ffn_roll"], plan["k32z_roll_from"] = 0, 0
+                    plan["k32z_roll_rungs"] = None
+            elif key == "push_from_vmem_rows":
+                plan[key] = None if value is None else int(value)
+            elif key == "defer_push":
+                plan[key] = bool(value)
+            else:
+                raise ValueError(f"unknown K32Z_LARGE_PLAN entry {key!r}")
+    return plan
+
+
+class K32ZTableGeometry(NamedTuple):
+    """One expert's K32Z shift tables: (rows, byte columns) of each matmul's
+    uint8 table, the K groups each covers and the gate/up field width."""
+
+    g1: int
+    g2: int
+    rows1: int
+    cols1: int
+    rows2: int
+    cols2: int
+    gate_up_bits: int
+
+    @property
+    def tab_rows(self):
+        """Rows of the decode's shift-word buffer: the taller table's groups."""
+        return align_up(max(self.g1, self.g2), U32_SUBLANE_TILE)
+
+
+def k32z_table_geometry(hidden, inter, gate_up_bits=K32Z_GATE_UP_BITS[0]):
+    """The K32Z tables for an expert shape; raises naming what it cannot take.
+
+    Blocks and chunks are whole 256s on both matmuls, which also makes every
+    shift-field tile of a 256-column chunk sit in one packed byte column. The
+    gate/up bases take inter byte columns of the down table's padding rows.
+    """
+    problems = []
+    if gate_up_bits not in K32Z_GATE_UP_BITS:
+        problems.append(
+            f"the gate/up shift field is {K32Z_GATE_UP_BITS} bits wide, "
+            f"not {gate_up_bits}"
+        )
+    if hidden % K32Z_CHUNK or inter % K32Z_CHUNK:
+        problems.append(
+            f"hidden={hidden} and inter={inter} must be multiples of "
+            f"{K32Z_CHUNK}: both matmuls decode whole {K32Z_CHUNK}-column "
+            f"chunks of {K32Z_KBLOCK}-row blocks with a {K32Z_CHUNK}-row tail"
+        )
+    if inter > hidden * K32Z_DOWN_BITS // 8:
+        problems.append(
+            f"the gate/up bases need {inter} byte columns of the down table, "
+            f"which has {hidden * K32Z_DOWN_BITS // 8}"
+        )
+    if problems:
+        raise ValueError("K32Z cannot lay out these experts: " + "; ".join(problems))
+    g1, g2 = hidden // K32Z_GROUP, inter // K32Z_GROUP
+    return K32ZTableGeometry(
+        g1=g1,
+        g2=g2,
+        rows1=align_up(g1, K32Z_U8_SUBLANE_TILE),
+        cols1=2 * inter * gate_up_bits // 8,
+        rows2=align_up(g2 + K32Z_BASE_ROWS, K32Z_U8_SUBLANE_TILE),
+        cols2=hidden * K32Z_DOWN_BITS // 8,
+        gate_up_bits=gate_up_bits,
+    )
+
+
+def k32z_tile_height_rungs(tile_m, rungs=None):
+    """The ascending tile heights a K32Z build emits: `rungs` (K32Z_RUNGS
+    where None) below tile_m, then tile_m. Always all of them, whatever the
+    expected expert size: an expert taller than a tile re-decodes per tile
+    and its tail tile takes the rung that covers it. A ladder without
+    K32Z_STREAMED_ROWS streams up to its tallest rung below it instead
+    (k32z_streamed_rows); the kernels read that, not the constant."""
+    rungs = K32Z_RUNGS if rungs is None else tuple(rungs)
+    if rungs != tuple(sorted(set(rungs))) or any(
+        r <= 0 or r % K32Z_RUNG_STEP for r in rungs
+    ):
+        raise ValueError(
+            f"K32Z rungs {rungs} must ascend in positive multiples of {K32Z_RUNG_STEP}"
+        )
+    return tuple(r for r in rungs if r < tile_m) + (tile_m,)
+
+
 def vmem_scratch_arrays(
     g_local,
     capacity,
@@ -1388,6 +2144,9 @@ def vmem_scratch_arrays(
     has_w1_bias=False,
     has_w2_bias=False,
     pad_scale_rows=False,
+    k32z_gate_up_bits=K32Z_GATE_UP_BITS[0],
+    k32z_ffn_roll=0,
+    mirror_unit=0,
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
@@ -1398,7 +2157,9 @@ def vmem_scratch_arrays(
     `pad_scale_rows` sizes the four-bit scale slots for the row-padded flat
     scale operand (fp4_scale_rows). The accounting leaves it at its default:
     an f32 slot's rows tile to U32_SUBLANE_TILE sublanes either way, so the
-    two forms cost the same VMEM.
+    two forms cost the same VMEM. `k32z_gate_up_bits` sizes K32Z's gate/up
+    shift table and is ignored by every other format, as is `k32z_ffn_roll`
+    (K32Z_FFN_ROLL), which adds the looped body's accumulator.
 
     Every element type here comes off the weight format's record: the
     weight slabs, the row staging the activations arrive in, the wire
@@ -1441,6 +2202,31 @@ def vmem_scratch_arrays(
                 jnp.float32,
             ),
         ]
+    elif weight_format == WeightFormat.K32Z:
+        geo = k32z_table_geometry(hidden, inter, k32z_gate_up_bits)
+        weights = [
+            # The codes stream packed exactly as FP4's do.
+            ("w1_vm", (nbuf, hidden // PACK4, 2 * inter), jnp.uint32),
+            ("w2_vm", (nbuf, inter // PACK4, hidden), jnp.uint32),
+            ("w1s_vm", (nbuf, geo.rows1, geo.cols1), jnp.uint8),
+            ("w2s_vm", (nbuf, geo.rows2, geo.cols2), jnp.uint8),
+            # The shift words of one 256-column chunk ([column tile in the
+            # chunk, group, lane], d * 0x04040404), double-buffered on the
+            # chunk's parity so the next chunk's build is not ordered behind
+            # the current chunk's last read.
+            (
+                "tab_vm",
+                (2, K32Z_CHUNK // K32Z_LANE_TILE, geo.tab_rows, K32Z_LANE_TILE),
+                jnp.int32,
+            ),
+            # The column scales 2^(b - 127): row 0 gate|up, row 1 down. Filled
+            # and read by the same tile, so one deep.
+            ("col_vm", (U32_SUBLANE_TILE, max(2 * inter, hidden)), jnp.float32),
+        ]
+        if k32z_ffn_roll:
+            # The looped body's chunk results: the gate/up accumulator, then
+            # the down one in the same rows (K32Z_FFN_ROLL).
+            weights.append(("acc_vm", (capacity, max(2 * inter, hidden)), jnp.float32))
     else:
         weights = [
             ("w1_vm", (nbuf, hidden, 2 * inter), form.weight_dtype),
@@ -1478,6 +2264,12 @@ def vmem_scratch_arrays(
         if form.quantized_activations
         else []
     )
+    unit = mirror_lanes(capacity, mirror_unit)
+    oscl_shape = (
+        (OUT_PARITIES, capacity // unit, 1, unit)
+        if unit < capacity
+        else (OUT_PARITIES, mirror_split(capacity), capacity // mirror_split(capacity))
+    )
     return [
         # The indirect form keeps each token row as one lane-block row.
         # Parity-deep for the same reason ls_vm is.
@@ -1494,12 +2286,21 @@ def vmem_scratch_arrays(
             (OUT_PARITIES, tile_m, lane_blocks, HIDDEN_LANE_BLOCK),
             form.wire_dtype,
         ),
-        ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
+        # One tile's scales: one mirror sublane, split as the mirrors are;
+        # with a mirror unit below the tile, one [1, unit] row per unit, so
+        # each is a DMA source of its own.
+        ("oscl_vm", oscl_shape, jnp.float32),
     ]
 
 
 def vmem_tile_body_arrays(
-    capacity, hidden, inter, *, weight_format=WeightFormat.FP8, rhs_qb=QB4
+    capacity,
+    hidden,
+    inter,
+    *,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=QB4,
+    k32z_ffn_roll=0,
 ):
     """What one tile body keeps live, as (name, shape, dtype).
 
@@ -1515,10 +2316,14 @@ def vmem_tile_body_arrays(
     widened contraction chunk, double-buffered; the two matmuls widen in
     turn and never overlap, so the peak is the wider of the two. Four-bit
     weights widen a scale block to fp8, integer weights a fixed contraction
-    chunk to bf16.
+    chunk to bf16. K32Z decodes one [K32Z_KBLOCK, K32Z_CHUNK] block at a
+    time (its output chunk loop is outermost), so it counts that block and
+    the shift words added to it, double-buffered, rather than a whole row of
+    blocks.
 
     The row staging a tile reads is a view of lhs_vm, not a second array,
-    so it is not counted again here.
+    so it is not counted again here; nor is a looped K32Z body's first
+    accumulator (`k32z_ffn_roll`), which is the declared acc_vm.
     """
     form = weight_form(weight_format)
     tile_m = capacity
@@ -1526,6 +2331,8 @@ def vmem_tile_body_arrays(
         ("acc1", (tile_m, 2 * inter), jnp.float32),
         ("mid_chunks", (tile_m, inter), jnp.bfloat16),
     ]
+    if weight_format == WeightFormat.K32Z and k32z_ffn_roll:
+        arrays = arrays[1:]
     # The second matmul takes the intermediate quantized only where its
     # weights are. The other formats contract the bf16 rows directly -- but
     # they still materialize a second copy: the non-requantizing path
@@ -1561,6 +2368,19 @@ def vmem_tile_body_arrays(
                 BF16,
             )
         )
+    elif weight_format == WeightFormat.K32Z:
+        arrays += [
+            (
+                "decoded_weight_block",
+                (WIDENED_BLOCK_BUFFERS, K32Z_KBLOCK, K32Z_CHUNK),
+                jnp.float8_e5m2,
+            ),
+            (
+                "shift_words",
+                (WIDENED_BLOCK_BUFFERS, K32Z_KBLOCK // 4, K32Z_CHUNK),
+                jnp.int32,
+            ),
+        ]
     return arrays
 
 
@@ -1575,6 +2395,9 @@ def vmem_estimate_bytes(
     has_w1_bias=False,
     has_w2_bias=False,
     info=None,
+    k32z_gate_up_bits=K32Z_GATE_UP_BITS[0],
+    k32z_ffn_roll=0,
+    mirror_unit=0,
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1600,9 +2423,17 @@ def vmem_estimate_bytes(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        k32z_gate_up_bits=k32z_gate_up_bits,
+        k32z_ffn_roll=k32z_ffn_roll,
+        mirror_unit=mirror_unit,
     )
     arrays += vmem_tile_body_arrays(
-        capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
+        capacity,
+        hidden,
+        inter,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        k32z_ffn_roll=k32z_ffn_roll,
     )
     return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
 
@@ -1639,6 +2470,9 @@ def fit_weight_slots(
     has_w2_bias=False,
     info=None,
     limit=None,
+    k32z_gate_up_bits=K32Z_GATE_UP_BITS[0],
+    k32z_ffn_roll=0,
+    mirror_unit=0,
 ):
     """The deepest prefetch schedule this shape's VMEM leaves room for.
 
@@ -1681,6 +2515,9 @@ def fit_weight_slots(
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
                 info=info,
+                k32z_gate_up_bits=k32z_gate_up_bits,
+                k32z_ffn_roll=k32z_ffn_roll,
+                mirror_unit=mirror_unit,
             ),
             limit,
         )

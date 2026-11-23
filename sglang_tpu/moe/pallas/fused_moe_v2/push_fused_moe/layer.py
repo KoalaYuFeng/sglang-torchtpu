@@ -25,6 +25,7 @@ from jax import lax
 
 from sglang_tpu._logging import get_logger
 from sglang_tpu.fp8_swiglu_mlp import fp8_swiglu_mlp
+from sglang_tpu.moe.pallas.fused_moe_v2 import host as _host
 from sglang_tpu.moe.pallas.fused_moe_v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -39,7 +40,9 @@ from sglang_tpu.moe.pallas.fused_moe_v2.host import (
     align_up,
     build_routing_tables,
     fp4_scale_rows,
+    k32z_table_geometry,
     local_slab_rows,
+    off_shard_slab_row,
     pair_block_hist,
     ragged_stride_bound,
     routing_block,
@@ -52,6 +55,7 @@ from sglang_tpu.moe.pallas.fused_moe_v2.host import (
 )
 from sglang_tpu.moe.pallas.fused_moe_v2.kernel import (
     build_combine_kernel,
+    check_ablation,
     combine_step_tokens,
     rowquant_fp8,
 )
@@ -67,7 +71,9 @@ from sglang_tpu.moe.pallas.fused_moe_v2.layer import (
     _unpack_routing_exchange,
     _unpermute_load_to_ep_rank_order,
 )
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import dedup as _dedup
 from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.host import (
+    _take_small,
     build_routing_tables_sharded,
     local_sort_activations,
     local_sort_tokens,
@@ -80,6 +86,7 @@ from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.kernel import (
     build_push_moe_kernel,
 )
 from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.plan_kernel import (
+    VISIT_ORDERS,
     build_exchange_rows_tables,
     build_push_tables,
 )
@@ -113,19 +120,79 @@ def _warn_sc_prepush_clamped(n_pre, g_local):
 # lost ~20 us a call with it while the 25-slot kernel held its time).
 LIGHT_PREPUSH_MIN_SLOTS = 16
 
+# Step 7 K2f: the K32Z push path's defaults per bucket (local rows per rank ->
+# push options), read at trace time. An option a caller leaves unset (None)
+# takes its value here on a K32Z build on the exchange-table path; every
+# other build, and every bucket not listed, keeps k32z-r2's program (all
+# off). V4.1 Flash EP8 on TPU v7x, layer 3, back-to-back period, uniform /
+# real (Step 7 K2e), each bitwise equal to the all-off build:
+# - 512: x_tables + fold_select, -17.4 / -20.0 us vs the K512 push build (the
+#   run-position tables take the window-rank glue off the pre-kernel path);
+#   the dedup does not pay there (its copies lift the compute+return bound).
+# - 1024: x_dedup + defer_push + fold_select, -35.7 / -28.9 us vs the K32Z
+#   all-gather build (the dedup cuts the link-bound dispatch bytes by a
+#   quarter); Step 7 O adds x_flat_owner (the owner tables folded on the flat
+#   pair tables: -17.7 / -17.8 us, the pre-kernel relayouts gone, bitwise).
+K32Z_PUSH_DEFAULTS = {
+    512: {"x_tables": True, "fold_select": True},
+    1024: {
+        "x_dedup": True,
+        "defer_push": True,
+        "fold_select": True,
+        "x_flat_owner": True,
+    },
+}
+
+
+def _select_routed(row_routes, combined):
+    """A row that routed nowhere read arrival rows nobody wrote; its weight is
+    zero, but zero times an unwritten NaN is not."""
+    return jnp.where(row_routes, combined, jnp.zeros_like(combined))
+
 
 def _combine_arrivals_fs(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype, routes=None
 ):
     """v2's `_combine_arrivals`, with the arrival-scale lookup done inside the
     combine kernel (see kernel._build_combine_kernel) where that kernel
-    applies; v2's XLA epilogue everywhere else."""
+    applies; v2's XLA epilogue everywhere else.
+
+    The fused lookup takes the whole arrival-scale mirror as scalar prefetch.
+    Tiles taller than one lane block (K32Z's 256 rows) double that mirror,
+    and there the fused combine measured 341-1137 us a call against 24-67 us
+    at 128-row tiles (V4.1 EP8 on TPU v7x, 512-2048 rows per rank, mirrors
+    of 811-848 KB vs 417-454 KB; Step 7 N2b), so those builds take v2's path,
+    whose coefficient gather runs in XLA. It gathers from the mirror viewed
+    as 128-lane rows: the same values in the same order, so a mirror
+    position indexes both views alike.
+
+    `routes` ([t_local, 1] bool, the layer's row_routes; Step 7 K2
+    fold_select) folds the layer's zeroing select into the fused combine,
+    one scalar predicate per token: the same bits as the select after it.
+    Where the fused combine does not apply, the select stays in XLA."""
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
+
+    def select(out):
+        return out if routes is None else _select_routed(routes, out)
+
     if not combine_step_tokens(t_local):
-        return _combine_arrivals(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+        return select(
+            _combine_arrivals(
+                arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+            )
+        )
+    if tile_m > HIDDEN_LANE_BLOCK:
+        return select(
+            _combine_arrivals(
+                arrivals,
+                arrival_scales.reshape(-1, HIDDEN_LANE_BLOCK),
+                pos,
+                mirror_pos,
+                topk_weights,
+                out_dtype,
+            )
         )
     # A DMA does not clamp an out-of-range index the way a gather does.
     # Neither position is ever negative.
@@ -139,8 +206,11 @@ def _combine_arrivals_fs(
         lane_blocks=lane_blocks,
         wire_dtype=arrivals.dtype,
         out_dtype=out_dtype,
+        **({} if routes is None else {"fold_select": True}),
     )
-    return combine(arrivals, arrival_scales, scl, topk_weights, rows)
+    if routes is None:
+        return combine(arrivals, arrival_scales, scl, topk_weights, rows)
+    return combine(arrivals, arrival_scales, scl, topk_weights, rows, routes=routes)
 
 
 def _repeat_bits(bits, repeats):
@@ -225,10 +295,26 @@ def fused_ep_moe_push(
     single_barrier=False,
     early_scale_scatter=0,
     fuse_metadata=True,
+    visit_order=0,
+    two_hop=False,
+    defer_push=None,
+    fold_select=None,
+    ret_last_off=0,
+    commit_only=False,
+    x_tables=None,
+    x_dedup=None,
+    x_dedup_local=False,
+    x_owner_visit=False,
+    x_gather_off=False,
+    x_src_cap=0,
+    x_flat_owner=None,
+    early_ship=None,
+    exchange_slab_rows=None,
     expert_slot=None,
     expert_load=None,
     shared_expert=None,
     shared_limit=None,
+    ablation=frozenset(),
 ):
     """Push implementation of fused_ep_moe_v2's fused stage.
 
@@ -253,10 +339,90 @@ def fused_ep_moe_push(
       (1), or before both the shared expert and SparseCore pre-push (2).
     - fuse_metadata allows routing metadata fusion in its measured envelope.
 
+    Step 7 K2f defaults: defer_push, fold_select, x_tables and x_dedup left
+    unset (None) take K32Z_PUSH_DEFAULTS' values for a K32Z build on the
+    exchange-table path at the buckets it lists (512 rows per rank: x_tables
+    and fold_select; 1024: x_dedup, defer_push and fold_select), and are off
+    everywhere else; ret_last_off keeps the dedup off. Passing False builds
+    k32z-r2's program at those buckets too.
+
+    Step 7 K2 switches (off unless set or defaulted as above, which builds
+    the programs of k32z-r2 unchanged; each one that is on puts a token in a
+    kernel name):
+    - visit_order=1: SparseCore positions are the lightest experts, the rest
+      follow in local expert id order (table kernel, token `_vo1`); needs
+      table_kernel and overrides light_prepush's order.
+    - two_hop: return through the HBM contribution slab even where tiles
+      could ship from VMEM (`_2h`); defer_push: on the two-hop path, drain
+      and push each expert after the next visit's first tile, as v2's
+      DEFER_PUSH (`_dp`).
+    - fold_select: the zeroing select of unrouted rows inside the fused
+      combine (`_sel` on the combine), bitwise the same output.
+    - ret_last_off=k, commit_only (benchmark only, INVALID output): the last
+      k visits keep their remote result rows home (`_rlo<k>`); no remote
+      return DMA at all, local commits and hops kept (`_cmo`).
+
+    Step 7 K2 per-rank dispatch dedup ("DZX", push_fused_moe.dedup; off
+    unless set or defaulted, and applied only at
+    dedup.X_MIN_TOKENS..X_MAX_TOKENS rows per rank -- elsewhere the build
+    is the default one). Each needs the
+    exchange-table path (tc_exchange, exchange_row_gather, table_kernel,
+    exchange_tables, kernel_plan_tables, sharded_plan):
+    - x_tables: each pair's run position rides in its payload word, and the
+      combine and slab-row tables are run base + position lookups (table
+      kernel token `_xt`). Same tables, so the same output bits.
+    - x_dedup (implies x_tables): a token's row goes to each destination
+      once, to its lowest local expert there; the other slots' rows are
+      copied from it in the destination's tile loads. Runs are owned rows
+      first; the SparseCore positions take whole runs; a destination with
+      more duplicates than x_src_cap (default dedup.default_src_cap) takes
+      whole runs too. The visit order is visit_order=1's (SparseCore
+      lightest, then local id), so every owner is visited before its
+      duplicates. Same output bits. Table kernel `_xd<cap>`, push kernel
+      `_xd`. x_dedup_local (`l`): own-rank slots deduplicated too;
+      x_owner_visit (`v`, the fallback): owner = the earliest visited slot,
+      in the bundle's own visit order, which takes a counts exchange first;
+      x_gather_off (`_xg0` on the push kernel; benchmark only, INVALID
+      output): tiles skip the duplicate copies. x_flat_owner (Step 7 O):
+      the receiver's owner tables folded on the flat [ep, t * K] pair
+      tables (dedup._group_fold) instead of [ep, t, K] reshapes, which
+      relayout topk-minor; the same values, so the same output bits.
+
+    Step 11 E1: early_ship=1 ships each (expert, dest) run
+    of the return from inside its expert's tile loop two tiles after the
+    tile that completes it, on the two-hop path (push kernel `_es`); the
+    runs that end in a visit's last two tiles ship where they do today.
+    The same DMAs, issued earlier, so the same output bits. early_ship=2
+    ships each run's per-tile pieces the same way (`_es2`); 3 only in each
+    rank's last two visits (`_es3`); 4 issues the tile loop's pushes after the
+    next tile's fetch (`_es4`).
+    Left unset (None) it takes host.K32Z_PUSH_EARLY_SHIP_MODES' value for a K32Z
+    build at those buckets when host.K32Z_PUSH_EARLY_SHIP is on, else 0: by
+    default 3 for a K32Z build at 1024 rows per rank and 0 everywhere else.
+
+    Step 12 P2: exchange_slab_rows computes the plan's
+    per-pair slab rows (routing_pairs_from_tables' slab_row, the scale-slab
+    scatter's index) inside the exchange-table kernel from the exchanged pair
+    words (plan_kernel.slab_rows_from_pairs; kernel token `_sr`) instead of
+    XLA's window histograms and lookups; the same integers. It applies on the
+    exchange-table plan path (exchange_tables, kernel_plan_tables) without
+    x_tables, else the build is the default one. Unset (None) takes
+    host.K32Z_PUSH_SLAB_ROWS (Step 12 I: on for a K32Z build at 8-256 rows per
+    rank, off for every other build); False builds the pre-P2 program.
+
     The optional replicated FP8 shared_expert runs while pre-push is in
     flight; its output is returned separately, last. The caller owns the
-    static expert layout and load accumulator."""
+    static expert layout and load accumulator.
+
+    K32Z (weight_format=WeightFormat.K32Z) takes fused_ep_moe_v2's K32Z
+    operands: float4 codes and the flat uint8 shift tables.
+
+    ablation (benchmark only, v2's kernel.ABLATIONS) removes parts of the
+    kernel; any non-empty set gives invalid output. disp_off pre-pushes every
+    visit position on the SparseCore (sc_prepush = local experts), so the
+    TensorCore kernel runs no dispatch."""
     del preprocess_topology
+    ablation = check_ablation(ablation)
     if early_scale_scatter not in (0, 1, 2):
         raise ValueError(f"early_scale_scatter is 0, 1 or 2; got {early_scale_scatter}")
     dispatch_ahead = int(dispatch_ahead)
@@ -267,12 +433,15 @@ def fused_ep_moe_push(
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
     for name, w in (("w1", w1), ("w2", w2)):
+        # Against the format's own element type: K32Z's weights are float4
+        # like FP4's, which weight_format_of_dtype names FP4.
         actual = weight_format_of_dtype(w.dtype)
-        if actual != weight_format:
+        if jnp.dtype(w.dtype) != jnp.dtype(form.weight_dtype):
             raise ValueError(
                 f"weight format {weight_format!r} takes "
                 f"{jnp.dtype(form.weight_dtype).name} expert weights and "
                 f"{name} is {jnp.dtype(w.dtype).name}"
+                f"{f', which is the {actual!r} form' if actual else ''}"
             )
     if form.has_scales != (w1_scale is not None):
         raise ValueError(
@@ -315,7 +484,42 @@ def fused_ep_moe_push(
         and form.scale_layout == "per_contraction_block"
         and w1_scale.ndim == 2
     )
-    if pad_scale_rows:
+    # K32Z's shift tables come flat only, [E * rows, cols] uint8, whole u8
+    # sublane tiles per expert (so the per-expert view is a bitcast). The
+    # gate/up field width is whatever the table's columns say it is.
+    k32z_gate_up_bits = None
+    # How its FFN body walks the output chunks, read once per trace
+    # (host.K32Z_FFN_ROLL) and keyed below like every other build choice.
+    k32z_ffn_roll = None
+    k32z_roll_from = 0
+    # And whether its scale mirrors take 128-lane units (host.K32Z_MIRROR_UNIT).
+    mirror_unit = 0
+    k32z_rungs = None
+    plan_tile_m = capacity
+    if form.scale_layout == "column_shift":
+        cols1 = w1_scale.shape[-1] if w1_scale.ndim == 2 else -1
+        k32z_gate_up_bits = (cols1 * 8) // (2 * inter) if inter else 0
+        mirror_unit = _host.K32Z_MIRROR_UNIT
+        k32z_rungs = (
+            None
+            if tuple(_host.K32Z_RUNGS) == _host.K32Z_DEFAULT_RUNGS
+            else tuple(_host.K32Z_RUNGS)
+        )
+        # The plan builders use their tile_m for the scale mirror's
+        # sublanes alone (and divisibility checks a unit passes), so they
+        # take the mirror's lanes (host.mirror_lanes).
+        plan_tile_m = _host.mirror_lanes(capacity, mirror_unit)
+        geo = k32z_table_geometry(hidden, inter, k32z_gate_up_bits)
+        for name, s, want in (
+            ("w1_scale", w1_scale, (e_total * geo.rows1, geo.cols1)),
+            ("w2_scale", w2_scale, (e_total * geo.rows2, geo.cols2)),
+        ):
+            if tuple(s.shape) != want or jnp.dtype(s.dtype) != jnp.dtype(jnp.uint8):
+                raise ValueError(
+                    f"{name} {jnp.dtype(s.dtype).name}{tuple(s.shape)} is not the "
+                    f"flat K32Z shift table uint8{want} the kernel takes"
+                )
+    elif pad_scale_rows:
         for name, s, k, n in (
             ("w1_scale", w1_scale, hidden, 2 * inter),
             ("w2_scale", w2_scale, inter, hidden),
@@ -401,6 +605,13 @@ def fused_ep_moe_push(
     if n_pre > g_local:
         _warn_sc_prepush_clamped(n_pre, g_local)
         n_pre = g_local
+    # x_dedup's SparseCore set (whole runs) stays the served one under
+    # disp_off, where the SparseCore fills every position before the kernel.
+    n_pre_x = n_pre
+    if "disp_off" in ablation:
+        # Benchmark only: the SparseCore fills every visit position's rows
+        # before the kernel, which then runs no dispatch of its own.
+        n_pre = g_local
     tc_exchange = bool(tc_exchange)
     exchange_row_gather = bool(exchange_row_gather)
     if kernel_plan_tables and not (table_kernel and sharded_plan):
@@ -414,6 +625,121 @@ def fused_ep_moe_push(
         raise ValueError("light_prepush orders the visits in the table kernel")
     if g_local < LIGHT_PREPUSH_MIN_SLOTS:
         light_prepush = 0
+    if visit_order not in VISIT_ORDERS:
+        raise ValueError(f"visit_order is one of {VISIT_ORDERS}; got {visit_order!r}")
+    visit_order = int(visit_order)
+    if visit_order and not table_kernel:
+        raise ValueError("visit_order orders the visits in the table kernel")
+    ret_last_off = int(ret_last_off)
+    if not 0 <= ret_last_off <= g_local:
+        raise ValueError(f"ret_last_off must be in [0, {g_local}]; got {ret_last_off}")
+    if ret_last_off and ep > g_local + 1:
+        raise ValueError(
+            "ret_last_off carries every rank's visit count in the dispatch "
+            f"meta row's {g_local + 1} unused words; ep={ep} does not fit"
+        )
+    # Step 7 K2f: the options a caller left unset take the K32Z push path's
+    # per-bucket defaults (K32Z_PUSH_DEFAULTS) on the exchange-table path;
+    # off everywhere else. ret_last_off reads returned rows from dispatched
+    # rows, so it keeps the dedup off.
+    tuned = {}
+    if k32z_gate_up_bits is not None and (
+        tc_exchange
+        and exchange_row_gather
+        and table_kernel
+        and exchange_tables
+        and kernel_plan_tables
+        and sharded_plan
+    ):
+        tuned = dict(K32Z_PUSH_DEFAULTS.get(t_local, {}))
+        if ret_last_off:
+            tuned.pop("x_dedup", None)
+    if defer_push is None:
+        defer_push = tuned.get("defer_push", False)
+    if fold_select is None:
+        fold_select = tuned.get("fold_select", False)
+    if x_tables is None:
+        x_tables = tuned.get("x_tables", False)
+    if x_flat_owner is None:
+        x_flat_owner = tuned.get("x_flat_owner", False)
+    if x_dedup is None:
+        x_dedup = tuned.get("x_dedup", False)
+    two_hop, defer_push = bool(two_hop), bool(defer_push)
+    fold_select, commit_only = bool(fold_select), bool(commit_only)
+    x_dedup, x_dedup_local = bool(x_dedup), bool(x_dedup_local)
+    x_owner_visit, x_gather_off = bool(x_owner_visit), bool(x_gather_off)
+    x_src_cap = int(x_src_cap)
+    if (x_dedup_local or x_owner_visit or x_gather_off or x_src_cap) and not x_dedup:
+        raise ValueError(
+            "x_dedup_local, x_owner_visit, x_gather_off and x_src_cap refine x_dedup"
+        )
+    if x_src_cap < 0:
+        raise ValueError(f"x_src_cap must be >= 0 (0: the default); got {x_src_cap}")
+    x_tables = bool(x_tables) or x_dedup
+    if x_tables and not (
+        tc_exchange
+        and exchange_row_gather
+        and table_kernel
+        and exchange_tables
+        and kernel_plan_tables
+        and sharded_plan
+    ):
+        raise ValueError(
+            "x_tables / x_dedup take the exchange-table path: tc_exchange, "
+            "exchange_row_gather, table_kernel, exchange_tables, "
+            "kernel_plan_tables and sharded_plan"
+        )
+    if x_dedup and ret_last_off:
+        raise ValueError(
+            "ret_last_off reads returned rows from dispatched rows, which "
+            "x_dedup makes fewer"
+        )
+    if not _dedup.x_applies(t_local):
+        # Outside the dedup buckets the build is the default one.
+        x_tables = x_dedup = x_dedup_local = x_owner_visit = x_gather_off = False
+        x_src_cap = 0
+    # Only the dedup reads it (the owner tables), so it keys nothing else.
+    x_flat_owner = bool(x_flat_owner) and x_dedup
+    if early_ship is None:
+        # Step 11 E1: unset takes the per-bucket default (host.K32Z_PUSH_EARLY_SHIP,
+        # on by default: 3 at 1024, 0 everywhere else).
+        early_ship = _host.push_early_ship_mode(
+            _host.K32Z_PUSH_EARLY_SHIP,
+            k32z=k32z_gate_up_bits is not None,
+            t_local=t_local,
+        )
+    if early_ship != int(early_ship) or int(early_ship) not in (0, 1, 2, 3, 4):
+        raise ValueError(f"early_ship is 0 (off), 1, 2, 3 or 4; got {early_ship!r}")
+    early_ship = int(early_ship)
+    if exchange_slab_rows is None:
+        # Step 12 I: unset takes the host default (K32Z at 8-256 rows per rank).
+        exchange_slab_rows = _host.push_slab_rows_mode(
+            _host.K32Z_PUSH_SLAB_ROWS,
+            k32z=k32z_gate_up_bits is not None,
+            t_local=t_local,
+        )
+    exchange_slab_rows = bool(
+        exchange_slab_rows
+        and exchange_tables
+        and kernel_plan_tables
+        and table_kernel
+        and exchange_row_gather
+        and not x_tables
+    )
+    x_cap = 0
+    x_tag = ""
+    if x_dedup:
+        x_cap = x_src_cap or _dedup.default_src_cap(ep, t_local)
+        x_tag = (
+            f"_xd{x_cap}"
+            + ("v" if x_owner_visit else "")
+            + ("l" if x_dedup_local else "")
+        )
+        if not x_owner_visit:
+            # The lowest-id owner needs SparseCore lightest, then id order.
+            visit_order = 1
+    elif x_tables:
+        x_tag = "_xt"
     if exchange_row_gather and not tc_exchange:
         raise ValueError(
             "exchange_row_gather needs the TensorCore exchange (tc_exchange)"
@@ -423,6 +749,12 @@ def fused_ep_moe_push(
     hbm_staging = bool(hbm_staging)
     # Every window past the last visit position issues the same program.
     dispatch_ahead = min(dispatch_ahead, g_local)
+    if k32z_gate_up_bits is not None:
+        # How the K32Z bodies walk their chunks, from the knobs and this
+        # build's slab (host.k32z_roll_plan); keyed below like the rest.
+        k32z_ffn_roll, k32z_roll_from = _host.k32z_roll_plan(
+            ragged_stride, ep, g_local, hidden, inter
+        )
     kfn = build_push_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -444,6 +776,34 @@ def fused_ep_moe_push(
         hbm_staging=hbm_staging,
         dispatch_ahead=dispatch_ahead,
         single_barrier=bool(single_barrier),
+        # Step 7 K2 switches, passed only when on: the default build keeps
+        # its cache key as well as its program.
+        **{
+            k: v
+            for k, v in (
+                ("two_hop", two_hop),
+                ("defer_push", defer_push),
+                ("ret_last_off", ret_last_off),
+                ("commit_only", commit_only),
+                ("x_dedup", x_dedup),
+                ("x_gather_off", x_gather_off),
+                ("early_ship", early_ship),
+            )
+            if v
+        },
+        **(
+            {}
+            if k32z_gate_up_bits is None
+            else {
+                "k32z_gate_up_bits": k32z_gate_up_bits,
+                "k32z_ffn_roll": k32z_ffn_roll,
+                "k32z_roll_from": k32z_roll_from,
+                "mirror_unit": mirror_unit,
+                # Read at trace time; None where it is the default ladder.
+                "k32z_rungs": k32z_rungs,
+            }
+        ),
+        **({"ablation": ablation} if ablation else {}),
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -469,6 +829,11 @@ def fused_ep_moe_push(
             w2s_l = next(operands).reshape(
                 g_local, fp4_scale_rows(inter, rhs_qb, padded=True), hidden
             )
+        elif k32z_gate_up_bits is not None:
+            # The same for the K32Z shift tables: whole u8 sublane tiles.
+            geo = k32z_table_geometry(hidden, inter, k32z_gate_up_bits)
+            w1s_l = next(operands).reshape(g_local, geo.rows1, geo.cols1)
+            w2s_l = next(operands).reshape(g_local, geo.rows2, geo.cols2)
         else:
             w1s_l = next(operands) if form.has_scales else None
             w2s_l = next(operands) if form.has_scales else None
@@ -565,10 +930,53 @@ def fused_ep_moe_push(
                 )
             )
         )
-        packed = _pack_routing_exchange(
-            local_blocks.reshape(-1), scale_bits_l, block_hist.sum(axis=0), layout
+        if not x_tables:
+            packed = _pack_routing_exchange(
+                local_blocks.reshape(-1), scale_bits_l, block_hist.sum(axis=0), layout
+            )
+            return topk_weights, packed, local_blocks, block_hist, row_routes, None
+        # Step 7 K2 (dedup.sender_tables): each pair's run position rides in
+        # its payload word; under x_dedup the runs are owned rows first and
+        # the count words carry the owned counts.
+        vp = None
+        if x_dedup and x_owner_visit:
+            # Owner = the earliest visited slot: every destination's visit
+            # order, from the counts every rank sends first.
+            width_c = align_up(e_total, HIDDEN_LANE_BLOCK)
+            counts_c = jnp.pad(
+                block_hist.sum(axis=0).astype(jnp.int32), (0, width_c - e_total)
+            )
+            rbd_c = build_tc_exchange_all_gather(
+                ep=ep, width=width_c, single_barrier=bool(single_barrier)
+            )(counts_c, me)
+            vpos = _dedup.visit_positions(
+                rbd_c.reshape(ep, width_c)[:, :e_total],
+                ep=ep,
+                g=g_local,
+                n_pre=n_pre,
+                light_prepush=light_prepush,
+                visit_order=visit_order,
+            )
+            vp = _take_small(vpos.reshape(e_total), topk_idx)
+        idx_l, count_words, sort_key, sort_counts = _dedup.sender_tables(
+            topk_idx,
+            me,
+            g_local=g_local,
+            e_total=e_total,
+            block=block,
+            block_hist=block_hist,
+            dedup=x_dedup,
+            local=x_dedup_local,
+            vp=vp,
         )
-        return topk_weights, packed, local_blocks, block_hist, row_routes
+        packed = _pack_routing_exchange(
+            _dedup.pack_pairs(local_blocks.reshape(-1), idx_l.reshape(-1)),
+            scale_bits_l,
+            count_words,
+            layout,
+        )
+        x_sender = (idx_l, sort_key, sort_counts)
+        return topk_weights, packed, local_blocks, block_hist, row_routes, x_sender
 
     def compute_local(
         q_sorted,
@@ -589,16 +997,22 @@ def fused_ep_moe_push(
         pre_tables=None,
         x_l=None,
         shared_l=None,
+        x_sender=None,
+        kernel_slab_row=None,
     ):
         """Dispatch tables, SparseCore pre-push, plan, kernel and combine.
 
         `pre_tables`, where the exchange kernel already built them, are
         build_push_tables' outputs; `shared_l`, the shared expert computed on
-        `x_l` between the pre-push and the kernel."""
+        `x_l` between the pre-push and the kernel; `x_sender` (x_tables) the
+        sender's (run positions, sort key, sort counts)."""
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
         )
+        if x_dedup:
+            # The count words carry the owned counts above the pair counts.
+            rows_by_dest = jnp.bitwise_and(rows_by_dest, _dedup.X_LOW_MASK)
         # The step's rows per physical slot, summed over every source rank:
         # identical on every shard, so the accumulator stays replicated.
         updated_load = (
@@ -623,8 +1037,9 @@ def fused_ep_moe_push(
                     me,
                     ep=ep,
                     n_pre=n_pre,
-                    tile_m=capacity,
+                    tile_m=plan_tile_m,
                     light_prepush=light_prepush,
+                    **({"visit_order": visit_order} if visit_order else {}),
                 )
             elif fused_dispatch_meta:
                 seg, dmeta, _, visit, counts_sc = push_dispatch_tables(
@@ -676,6 +1091,8 @@ def fused_ep_moe_push(
                         jnp.sum(seg_n[1:n_pre:2] * seg_remote),
                     ]
                 ).astype(jnp.int32)
+        # x_dedup's table kernel returns its x tables last.
+        x_pair = shard_tables.pop() if x_dedup else None
         # Compute the pre-push operands before the routing plan, so XLA
         # launches the SparseCore dispatch ahead of it and the two overlap.
         # The plan reads pairs_g, so it follows the barrier either way; the
@@ -723,7 +1140,7 @@ def fused_ep_moe_push(
             ep=ep,
             t_local=t_local,
             block=block,
-            tile_m=capacity,
+            tile_m=plan_tile_m,
             shard_stride=ragged_stride,
         )
         gathered = None
@@ -739,7 +1156,39 @@ def fused_ep_moe_push(
         pair_tables = None
         routing_inputs = None
         routing = None
-        if kernel_plan_tables:
+        x_src = None
+        if kernel_plan_tables and x_tables:
+            # Step 7 K2: every pair's run position came with it, so its
+            # arrival row, mirror position and slab row are run base + idx;
+            # under x_dedup also SRC, each duplicate row's owner slab row.
+            assert shard_tables is not None and x_sender is not None
+            recv_base_me, mirror_base, run_base = shard_tables[4]
+            vpos_me = None
+            if x_dedup and x_owner_visit:
+                vpos_me = _dedup.my_visit_positions(
+                    visit, shard_tables[3][_host.COUNT_VISITS].sum(), g_local
+                )
+            slab_row, x_src = _dedup.receiver_tables(
+                pairs_g,
+                me,
+                run_base,
+                g_local=g_local,
+                t_local=t_local,
+                topk=topk,
+                shard_stride=ragged_stride,
+                ep=ep,
+                x_g=None if x_pair is None else x_pair[0],
+                cap=x_cap,
+                vpos_me=vpos_me,
+                flat_owner=x_flat_owner,
+            )
+            pair_tables = _dedup.pair_positions(
+                local_blocks.reshape(t_local, topk),
+                x_sender[0],
+                recv_base_me,
+                mirror_base,
+            ) + (slab_row,)
+        elif kernel_plan_tables:
             # The table kernel built the plan's small tables; only the
             # per-pair lookups are left.
             assert shard_tables is not None
@@ -752,6 +1201,7 @@ def fused_ep_moe_push(
                 t_local=t_local,
                 block=block,
                 shard_stride=ragged_stride,
+                **({} if kernel_slab_row is None else {"slab_row": kernel_slab_row}),
             )
             slab_row = pair_tables[2]
         elif sharded_plan and shard_tables is None:
@@ -832,6 +1282,14 @@ def fused_ep_moe_push(
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
         w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
+        if ret_last_off:
+            # Benchmark only: the kernel works out the rows its peers keep
+            # home from the segment table and each peer's visit count, which
+            # rides in the meta row's unused leading words.
+            n_visit_all = jnp.sum(
+                rows_by_dest.sum(axis=0).reshape(ep, g_local) > 0, axis=1
+            ).astype(jnp.int32)
+            dmeta = dmeta.at[:ep].set(n_visit_all)
         arrivals, arrival_scales = kfn(
             kernel_tables,
             expert_rows,
@@ -850,6 +1308,7 @@ def fused_ep_moe_push(
             rank=rank_l,
             dispatch=(seg, dmeta),
             slab=slab,
+            **({} if x_pair is None else {"x": (x_pair[1], x_src)}),
         )
 
         # The destination's own table: one arrival row per selection slot.
@@ -871,12 +1330,21 @@ def fused_ep_moe_push(
                 (me * t_local, 0),
                 (t_local, topk),
             )
-        combined = _combine_arrivals_fs(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
-        )
-        # A row that routed nowhere read arrival rows nobody wrote; its weight is
-        # zero, but zero times an unwritten NaN is not.
-        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if fold_select:
+            combined = _combine_arrivals_fs(
+                arrivals,
+                arrival_scales,
+                pos,
+                mirror_pos,
+                topk_weights,
+                out_dtype,
+                routes=row_routes,
+            )
+        else:
+            combined = _combine_arrivals_fs(
+                arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+            )
+            combined = _select_routed(row_routes, combined)
         out = token_layout.restore(combined, ax)
         outs = (out,) + (() if updated_load is None else (updated_load,))
         outs += tuple(shared_out)
@@ -896,33 +1364,64 @@ def fused_ep_moe_push(
             bias_it,
         ) = unpack_operands(scales_gating_biases)
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
-        topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
+        selected = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
         )
+        topk_weights, packed, local_blocks, block_hist, row_routes, x_sender = selected
         pre_tables = None
+        kernel_slab_row = None
         my_counts = block_hist.sum(axis=0)
         if exchange_row_gather:
             # The sorted rows are copied by the exchange kernel itself.
             with jax.named_scope("moe_early_qsort"):
-                tok, seg_start = local_sort_tokens(
-                    local_blocks.reshape(-1),
-                    my_counts,
-                    e_total=e_total,
-                    topk=topk,
-                    bf16_counts=bf16_sort_counts,
-                )
+                if x_dedup:
+                    # Owned rows first in each run: the counting sort over
+                    # key 2 * id + dup, read back per expert.
+                    tok, seg_start = local_sort_tokens(
+                        x_sender[1],
+                        x_sender[2],
+                        e_total=2 * e_total,
+                        topk=topk,
+                        bf16_counts=bf16_sort_counts,
+                    )
+                    seg_start = seg_start[0::2]
+                else:
+                    tok, seg_start = local_sort_tokens(
+                        local_blocks.reshape(-1),
+                        my_counts,
+                        e_total=e_total,
+                        topk=topk,
+                        bf16_counts=bf16_sort_counts,
+                    )
             if exchange_tables:
-                exchange, q_sorted, *pre_tables = build_exchange_rows_tables(
+                x_kw = {}
+                if x_tables:
+                    x_kw = dict(
+                        x_tag=x_tag, x_dedup=x_dedup, x_npre=n_pre_x, x_cap=x_cap
+                    )
+                if exchange_slab_rows:
+                    # Step 12 P2: the plan's slab rows from the kernel too.
+                    x_kw = dict(
+                        slab_pairs=t_local * topk,
+                        slab_off=off_shard_slab_row(ragged_stride, ep),
+                        slab_stride=ragged_stride,
+                    )
+                ex_out = build_exchange_rows_tables(
                     ep=ep,
                     width=layout[-1],
                     n_rows=tok.shape[0],
                     count_at=layout[1],
                     e_total=e_total,
                     n_pre=n_pre,
-                    tile_m=capacity,
+                    tile_m=plan_tile_m,
                     light_prepush=light_prepush,
                     single_barrier=bool(single_barrier),
+                    **({"visit_order": visit_order} if visit_order else {}),
+                    **x_kw,
                 )(packed, rank_l[0, 0], q_l, tok, seg_start)
+                if exchange_slab_rows:
+                    ex_out, kernel_slab_row = ex_out
+                exchange, q_sorted, *pre_tables = ex_out
             else:
                 exchange, q_sorted = build_tc_exchange_all_gather_rows(
                     ep=ep,
@@ -969,6 +1468,8 @@ def fused_ep_moe_push(
             pre_tables,
             x_l,
             shared_l,
+            x_sender,
+            kernel_slab_row,
         )
 
     bias_args = tuple(b for b in (w1_bias, w2_bias) if b is not None)
@@ -1058,7 +1559,27 @@ def fused_ep_moe_push(
         bool(single_barrier),
         int(early_scale_scatter),
         bool(fuse_metadata),
-    )
+        k32z_gate_up_bits,
+        k32z_ffn_roll,
+        k32z_roll_from,
+        mirror_unit,
+        k32z_rungs,
+        ablation,
+        visit_order,
+        two_hop,
+        defer_push,
+        fold_select,
+        ret_last_off,
+        commit_only,
+        x_tables,
+        x_dedup,
+        x_dedup_local,
+        x_owner_visit,
+        x_gather_off,
+        x_cap,
+        x_flat_owner,
+        early_ship,
+    ) + ((True,) if exchange_slab_rows else ())
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]
     sm = _LAYER_SM_CACHE.get(key)
